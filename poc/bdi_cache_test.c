@@ -76,7 +76,7 @@ typedef struct {
     uint64_t tag:CACHE_TAG_BITS;
     uint64_t valid:1;
     uint64_t segment:CACHE_SEGMENT_BITS;
-    uint64_t lru:CACHE_LRU_BITS;
+    uint64_t zero_bitmask:32;
     comp_type_t comp_type;
 } comp_cache_tag_t;
 
