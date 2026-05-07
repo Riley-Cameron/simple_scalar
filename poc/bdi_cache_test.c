@@ -75,7 +75,7 @@ typedef struct {
 typedef struct {
     uint64_t tag:CACHE_TAG_BITS;
     uint64_t valid:1;
-    uint64_t segment:CACHE_SEGMENT_BITS;
+    uint64_t segment:CACHE_SEGMENT_BITS;    // Segment index
     uint64_t zero_bitmask:32;
     comp_type_t comp_type;
 } comp_cache_tag_t;
@@ -99,6 +99,28 @@ void print_data(uint8_t *data, uint8_t size) {
     printf("\n");
 }
 
+int generate_entry(uint8_t *rand_data, uint32_t *rand_zero_mask, comp_type_t *rand_comp_type) {
+    *rand_zero_mask = (rand() << 15) + rand();
+    *rand_comp_type = rand() % NUM_COMP_TYPE;
+    uint8_t size = get_comp_size_64(*rand_comp_type);
+    rand_data = NULL;
+
+    rand_data = malloc(size);
+    if (rand_data == NULL) {
+        printf("Error: failed to allocate a data entry");
+        return -1;
+    }
+
+    for (int i = 0; i < size; i++) {
+        rand_data[i] = rand() % 256;
+    }
+
+    printf("Generated Random Data: zero-mask=b%32b comp-type=b%04b data=", *rand_zero_mask, *rand_comp_type);
+    print_data(rand_data, size);
+
+    return 0;
+}
+
 int read_cache(uint32_t addr) {
     cache_addr_t *c_addr = (cache_addr_t *)&addr;
     comp_cache_tag_t *tag = NULL;
@@ -116,36 +138,69 @@ int read_cache(uint32_t addr) {
         read_data = malloc(get_comp_size_64(tag->comp_type));
         memcpy(read_data, &BDI_CACHE[c_addr->index].data[(tag->segment)*CACHE_SEGMENT_SIZE], get_comp_size_64(tag->comp_type));
 
-        printf("Read from set %d: compression-type=%04b starting-segment=%d size=%d\n\t", c_addr->index, tag->comp_type, tag->segment, get_comp_size_64(tag->comp_type));
+        printf("Read from set 0x%03X: compression-type=%04b starting-segment=%d size=%d zero-mask=%b\n\t", c_addr->index, tag->comp_type, tag->segment, get_comp_size_64(tag->comp_type), tag->zero_bitmask);
         print_data(read_data, get_comp_size_64(tag->comp_type));
+        //TODO: pass comp-type, data, and zero-mask to decompression alg
+        free(read_data);
     } else { // If not found, pass the request to main mem then allocate an entry (may need to evict 1+ entries)
-
+        //TODO: make "replacement" function
     }
 
     return 0;
 }
 
-int write_cache(uint32_t addr, uint8_t *data, comp_type_t comp_type) {
-    // Search the tag array for match
+int write_cache(uint32_t addr, uint8_t *data, comp_type_t comp_type, uint32_t zero_bitmask) {
+    cache_addr_t *c_addr = (cache_addr_t *)&addr;
+    comp_cache_tag_t *tag = NULL;
+
+    // Search the tag array for a match
+    for (int i = 0; i < CACHE_TAGS; i++) {
+        if (BDI_CACHE[c_addr->index].tags[i].valid && (BDI_CACHE[c_addr->index].tags[i].tag == c_addr->tag)) {
+            tag = &BDI_CACHE[c_addr->index].tags[i];
+        }
+    }
 
     // If found, write new data (may need to evict other entries if size changed)
+    if (tag != NULL) {
+        // Check if new size is smaller or larger than existing entry
+        if (get_comp_size_64(comp_type) <= get_comp_size_64(tag->comp_type)) { // smaller (or equal) size
+            memcpy(&BDI_CACHE[c_addr->index].data[(tag->segment)*CACHE_SEGMENT_SIZE], data, get_comp_size_64(comp_type));
+            tag->comp_type = comp_type;
+            tag->zero_bitmask = zero_bitmask;
+        } else { // larger (replacement required!)
+            //TODO
+        }
+    } else { // If not found 
+        uint8_t required_segments = get_comp_size_64(comp_type) / CACHE_SEGMENT_SIZE; // determine how many segments this write will fill
+        uint64_t segment_map = 0; // track free vs filled segments in a bitmap
+        for (int i = 0; i < CACHE_TAGS; i++) { // search for free segments
+            if (BDI_CACHE[c_addr->index].tags[i].valid) { // enter each valid entry into the map
+                segment_map |= ((1 << ((get_comp_size_64(BDI_CACHE[c_addr->index].tags[i].comp_type)/CACHE_SEGMENT_SIZE)+1))-1) << BDI_CACHE[c_addr->index].tags[i].segment;
+            }
+        }
 
-    //TODO: If not found...
+        for (int i = 0; i < CACHE_SEGMENTS; i++) {
+            
+        }
+
+    }
 }
 
 int main (int argc, char** argv) {
     for (int i = 0; i < NUM_COMP_TYPE; i++) {
-        printf("Compression type %04b base=%d-bits deltas=%d-bits\n", i, get_comp_base(i), get_comp_delta(i));
+        printf("Compression type %04b base=%d-bytes deltas=%d-bytes\n", i, get_comp_base(i), get_comp_delta(i));
     }
 
-    uint32_t addr = 0x11223344;
-    cache_addr_t *c_addr = (cache_addr_t*)&addr;
-    printf("t=%X i=%X o=%X\n", c_addr->tag, c_addr->index, c_addr->offset);
-    printf("bits: t=%X i=%X o=%X\n", CACHE_TAG_BITS, CACHE_INDEX_BITS, CACHE_OFFSET_BITS);
+    uint8_t *data;
+    comp_type_t comp_type;
+    uint32_t zero_mask;
 
-    BDI_CACHE[c_addr->index].tags[0].tag = c_addr->tag;
-    BDI_CACHE[c_addr->index].tags[0].valid = 1;
-    BDI_CACHE[c_addr->index].tags[0].comp_type = COMP_TYPE_B8_D1;
-    read_cache(addr);
+    for (int i = 0; i < 20; i++) {
+        if (!generate_entry(data, &zero_mask, &comp_type)) {
+            free(data);
+        } else {
+            return -1;
+        }
+    }
     return 0;
 }
