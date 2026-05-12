@@ -158,6 +158,21 @@ void print_data(uint8_t *data, size_t size) {
     printf("\n");
 }
 
+/**
+ * @brief Print the LRU order of the given set
+ * 
+ * @param set 
+ */
+void print_lru_order(comp_cache_set_t *set) {
+    comp_cache_blk_t *blk = set->way_head;
+    printf("Head (MRU) -> ");
+    while (blk != NULL) {
+        printf("0x%X ", blk->tag);
+        blk = blk->way_next;
+    }
+    printf("<- Tail (LRU)\n");
+}
+
 typedef enum { Head, Tail } list_loc_t;
 /**
  * @brief insert BLK into the order way chain in SET at location WHERE
@@ -312,6 +327,7 @@ uint16_t evict_cache(comp_type_t comp_type, int index, comp_cache_blk_t **blk) {
     printf("req-seg: %d seg-map: %032lb\n", required_segments, segment_map);
 
     // Use the segment map to search for an open region big enough to accomodate the compressed data
+    // TODO: prioritize LRU when Segments are full!
     uint8_t avail_segments = 0;
     uint8_t max_avail_segments = 0;
     uint16_t max_avail_segments_idx = 0;
@@ -399,6 +415,7 @@ int write_cache(uint32_t addr, uint8_t *data, comp_type_t comp_type, uint32_t ze
             memcpy(&BDI_CACHE[c_addr->index].data[(blk->segment)*CACHE_SEGMENT_SIZE], data, get_comp_size_64(comp_type));
             blk->comp_type = comp_type;
             blk->zero_bitmask = zero_bitmask;
+            printf("seg-idx: %d size: %d tag: 0x%X\n", blk->segment, get_comp_size_64(comp_type), blk->tag);
         } else { // larger (replacement required!)
             printf("New data is too large to write cleanly into the previous entry! Evicting...\n");
             uint16_t segment_idx = evict_cache(comp_type, c_addr->index, &blk);
@@ -477,21 +494,12 @@ int main (int argc, char** argv) {
         } else {
             return -1;
         }
+        print_lru_order(&BDI_CACHE[a->index]);
         print_data(BDI_CACHE[a->index].data, CACHE_SET_SIZE);
         a->tag++;
 
         if (i == 8) {a->tag -= 8;}
     }
-
-    // Testing Linked List
-    // for (int i = 0; i < CACHE_BLOCKS; i++) {
-    //     BDI_CACHE[0].blks[i].tag = i;
-    // }
-    // printf("head-tag: %d tail-tag: %d\n", BDI_CACHE[0].way_head->tag, BDI_CACHE[0].way_tail->tag);
-    // update_way_list(&BDI_CACHE[0], &BDI_CACHE[0].blks[4], Head);
-    // printf("head-tag: %d tail-tag: %d\n", BDI_CACHE[0].way_head->tag, BDI_CACHE[0].way_tail->tag);
-    // update_way_list(&BDI_CACHE[0], &BDI_CACHE[0].blks[4], Tail);
-    // printf("head-tag: %d tail-tag: %d\n", BDI_CACHE[0].way_head->tag, BDI_CACHE[0].way_tail->tag);
 
     return 0;
 }
