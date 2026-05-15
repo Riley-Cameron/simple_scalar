@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 
 #define LOG2_8(x)  ((x) >= 128 ? 7 : (x) >= 64 ? 6 : (x) >= 32 ? 5 : (x) >= 16 ? 4 : \
                     (x) >= 8   ? 3 : (x) >= 4  ? 2 : (x) >= 2  ? 1 : 0)
@@ -102,6 +103,13 @@ typedef struct {
 } comp_cache_set_t;
 
 comp_cache_set_t BDI_CACHE[CACHE_SETS];
+
+typedef struct {
+    uint64_t base;
+    int32_t deltas[32];
+    int32_t zero_bitmask;
+    comp_type_t comp_type;
+} comp_data_t; 
 
 /**
  * @brief Get the compression type's base size
@@ -237,7 +245,8 @@ static void update_way_list(comp_cache_set_t *set, comp_cache_blk_t *blk, list_l
 uint8_t *generate_entry(uint32_t *rand_zero_mask, comp_type_t *rand_comp_type) {
     *rand_zero_mask = (rand() << 15) + rand();
     *rand_comp_type = rand() % NUM_COMP_TYPE;
-    uint8_t size = get_comp_size_64(*rand_comp_type);
+    // uint8_t size = get_comp_size_64(*rand_comp_type);
+    uint8_t size = 64;
     uint8_t *rand_data = NULL;
 
     rand_data = malloc(size);
@@ -251,7 +260,7 @@ uint8_t *generate_entry(uint32_t *rand_zero_mask, comp_type_t *rand_comp_type) {
         rand_data[i] = rand_byte;
     }
 
-    printf("Generated Random Data: zero-mask=b%32b comp-type=b%04b data=", *rand_zero_mask, *rand_comp_type);
+    // printf("Generated Random Data: zero-mask=b%32b comp-type=b%04b data=", *rand_zero_mask, *rand_comp_type);
     print_data(rand_data, size);
 
     return rand_data;
@@ -397,10 +406,396 @@ int read_cache(uint32_t addr) {
     return 0;
 }
 
-int write_cache(uint32_t addr, uint8_t *data, comp_type_t comp_type, uint32_t zero_bitmask) {
+//base 8 delta 1 check
+comp_data_t check_B8D1(uint8_t *data){
+
+    comp_data_t comp_data = {0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    uint64_t values[8] = {0};
+    uint32_t zero_bitmask = 0;
+    uint64_t arb_base = 0;
+    int bdi_count = 0;
+    bool arb_base_set = false;
+    for(int i=0; i<64; i=i+8){
+        uint64_t val = 0;
+        for(int j=i; j<i+8; j++){
+            val = val << 8 | data[j];
+        }
+        values[i/8] = val;
+        int64_t delta = -(int64_t)val;
+        if(delta >= -128 && delta <= 127){
+            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            comp_data.deltas[i/8] = (int32_t) delta;
+        }
+        else {
+            if(!arb_base_set) {
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0;i<8;i++){
+        if(zero_bitmask & (0x80 >> i)){
+            bdi_count++;
+        }
+        else{
+            uint64_t diff = arb_base - values[i];
+            int64_t sdiff = (int64_t)diff;
+            if (sdiff >= -128 && sdiff <= 127) {
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if (bdi_count == 8) {
+        comp_data.base = (uint64_t)arb_base;
+        comp_data.comp_type = COMP_TYPE_B8_D1;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+    
+//check base 4 delta 1
+comp_data_t check_B4D1(uint8_t *data){
+
+    comp_data_t comp_data ={0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    bool arb_base_set = false;
+    uint16_t zero_bitmask = 0;
+    uint32_t arb_base = 0;
+    int bdi_count = 0;
+    uint32_t values[16] = {0};
+    for(int i=0; i<64; i=i+4){
+        uint32_t val = 0;
+        for(int j=i; j<i+4; j++){
+            val = (val << 8) | data[j];
+        }
+        values[i/4] = val;
+        int64_t delta = -(int64_t) val;
+        if( delta >= -128 && delta <= 127){
+            zero_bitmask = zero_bitmask | (0x8000 >> i/4);
+            comp_data.deltas[i/4] = (int32_t) delta;
+        }
+        else {
+            if(!arb_base_set){
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0; i<16; i++){
+        if(zero_bitmask & (0x8000 >> i)){
+            bdi_count++;
+        }
+        else {
+            uint32_t diff = arb_base - values[i];
+            int32_t sdiff = (int32_t)diff;
+            if(sdiff >= -128 && sdiff <= 127){
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if(bdi_count == 16){
+        comp_data.base = arb_base;
+        comp_data.comp_type = COMP_TYPE_B4_D1;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+
+//check base 8 delta 2
+comp_data_t check_B8D2(uint8_t *data) {
+    
+    comp_data_t comp_data ={0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    bool arb_base_set = false;
+    uint32_t zero_bitmask = 0;
+    uint64_t arb_base = 0;
+    int bdi_count = 0;
+    uint64_t values[8] = {0};
+    for(int i=0; i<64; i=i+8){
+        uint64_t val = 0;
+        for(int j=i; j<i+8; j++){
+            val = (val << 8) | data[j];
+        }
+        values[i/8] = val;
+        int64_t delta = -(int64_t) val;
+        if( delta >= -32768 && delta <= 32767){
+            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            comp_data.deltas[i/8] = (int32_t) delta;
+        }
+        else {
+            if(!arb_base_set){
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0; i<8; i++){
+        if(zero_bitmask & (0x80 >> i)){
+            bdi_count++;
+        }
+        else {
+            uint64_t diff = arb_base - values[i];
+            int64_t sdiff = (int64_t)diff;
+            if(sdiff >= -32768 && sdiff <= 32767){
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if(bdi_count == 8){
+        comp_data.base = arb_base;
+        comp_data.comp_type = COMP_TYPE_B8_D2;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+
+//check base 2 delta 1
+comp_data_t check_B2D1(uint8_t *data){
+
+    comp_data_t comp_data = {0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    bool arb_base_set = false;
+    uint32_t zero_bitmask = 0;
+    uint16_t arb_base = 0;
+    int bdi_count = 0;
+    uint16_t values[32] = {0};
+
+    for(int i=0; i<64; i=i+2){
+        uint16_t val = 0;
+        for(int j=i; j<i+2; j++){
+            val = (val << 8) | data[j];
+        }
+        values[i/2] = val;
+        int32_t delta  = -(int32_t) val;
+        if(delta >= -128 && delta <= 127){
+            zero_bitmask = zero_bitmask | 0x80000000 >> i/2;
+            comp_data.deltas[i/2] = (int32_t) delta;
+        }
+        else{
+            if(!arb_base_set){
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0; i<32; i++){
+        if(zero_bitmask & (0x80000000 >> i)){
+            bdi_count++;
+        }
+        else{
+            uint16_t diff = arb_base - values[i];
+            int16_t sdiff = (int16_t)diff;
+            if(sdiff >= -128 && sdiff <= 127){
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if(bdi_count == 32){
+        comp_data.base = arb_base;
+        comp_data.comp_type = COMP_TYPE_B2_D1;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+
+//check base 4 delta 2
+comp_data_t check_B4D2(uint8_t *data){
+
+    comp_data_t comp_data = {0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    bool arb_base_set = false;
+    uint16_t zero_bitmask = 0;
+    uint32_t arb_base = 0;
+    int bdi_count = 0;
+    uint32_t values[16] = {0};
+    for(int i=0; i<64; i=i+4){
+        uint32_t val = 0;
+        for(int j=i; j<i+4; j++){
+            val = (val << 8) | data[j];
+        }
+        values[i/4] = val;
+        int32_t delta = -(int32_t) val;
+        if( delta >= -32768 && delta <= 32767){
+            zero_bitmask = zero_bitmask | (0x8000 >> i/4);
+            comp_data.deltas[i/4] = (int32_t) delta;
+        }
+        else {
+            if(!arb_base_set){
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0; i<16; i++){
+        if(zero_bitmask & (0x8000 >> i)){
+            bdi_count++;
+        }
+        else {
+            uint32_t diff = arb_base - values[i];
+            int32_t sdiff = (int32_t)diff;
+            if(sdiff >= -32768 && sdiff <= 32767){
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if(bdi_count == 16){
+        comp_data.base = arb_base;
+        comp_data.comp_type = COMP_TYPE_B4_D2;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+
+//check base 8 delta 4
+comp_data_t check_B8D4(uint8_t *data){
+    comp_data_t comp_data = {0};
+    comp_data.comp_type = COMP_TYPE_NONE;
+    bool arb_base_set = false;
+    uint32_t zero_bitmask = 0;
+    uint64_t arb_base = 0;
+    int bdi_count = 0;
+    uint64_t values[8] = {0};
+    for(int i=0; i<64; i=i+8){
+        uint64_t val = 0;
+        for(int j=i; j<i+8; j++){
+            val = (val << 8) | data[j];
+        }
+        values[i/8] = val;
+        int64_t delta = -(int64_t) val;
+        if( delta >= INT32_MIN && delta <= INT32_MAX){
+            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            comp_data.deltas[i/8] = (int32_t) delta;
+        }
+        else {
+            if(!arb_base_set){
+                arb_base = val;
+                arb_base_set = true;
+            }
+        }
+    }
+
+    for(int i=0; i<8; i++){
+        if(zero_bitmask & (0x80 >> i)){
+            bdi_count++;
+        }
+        else {
+            uint64_t diff = arb_base - values[i];
+            int64_t sdiff = (int64_t)diff;
+            if(sdiff >= INT32_MIN && sdiff <= INT32_MAX){
+                bdi_count++;
+                comp_data.deltas[i] = (int32_t)sdiff;
+            }
+        }
+    }
+
+    if(bdi_count == 8){
+        comp_data.base = arb_base;
+        comp_data.comp_type = COMP_TYPE_B8_D4;
+        comp_data.zero_bitmask = zero_bitmask;
+    }
+
+    return comp_data;
+}
+
+comp_data_t compress_data(uint8_t *data) {
+
+    uint32_t zero_bitmask = 0;
+    uint64_t arb_base8 = 0;
+    uint32_t arb_base4 = 0;
+    bool arb_base_set = false;
+    int bdi_count = 0;
+    int sum = 0;
+    bool rep = true;
+    comp_data_t comp_data;
+    comp_data.comp_type = COMP_TYPE_NONE;
+
+    for(int i=0; i<64; i++){
+        sum += data[i];
+    }
+
+    if(sum == 0) {
+        comp_data.comp_type = COMP_TYPE_ZERO;
+        return comp_data;
+    }
+
+    uint64_t rep_val[8];
+    for(int i=0; i<64; i=i+8){
+        uint64_t val = 0;
+        for(int j=i; j<i+8; j++){
+            val = (val << 8) | data[j]; 
+        }
+        rep_val[i/8] = val;
+    }
+
+    for(int i=0; i<8; i++){
+        if(rep_val[0] != rep_val[i]){
+            rep = false;
+            break;
+        }
+    }
+
+    if(rep) {
+        comp_data.base = rep_val[0];
+        comp_data.comp_type = COMP_TYPE_REP_VAL;
+        return comp_data;
+    }
+
+    comp_data = check_B8D1(data);
+    if(comp_data.comp_type == COMP_TYPE_B8_D1) return comp_data;
+
+    comp_data = check_B4D1(data);
+    if(comp_data.comp_type == COMP_TYPE_B4_D1) return comp_data;
+
+    comp_data = check_B8D2(data);
+    if(comp_data.comp_type == COMP_TYPE_B8_D2) return comp_data;
+
+    comp_data = check_B2D1(data);
+    if(comp_data.comp_type == COMP_TYPE_B2_D1) return comp_data;
+
+    comp_data = check_B4D2(data);
+    if(comp_data.comp_type == COMP_TYPE_B4_D2) return comp_data;
+
+    comp_data = check_B8D4(data);
+    if(comp_data.comp_type == COMP_TYPE_B8_D4) return comp_data;
+
+    printf("comp_type = %0d", comp_data.comp_type);
+
+    return comp_data;
+   
+}
+
+// int write_cache(uint32_t addr, uint8_t *data, comp_type_t comp_type, uint32_t zero_bitmask) {
+int write_cache(uint32_t addr, uint8_t *data) {
     cache_addr_t *c_addr = (cache_addr_t *)&addr;
     comp_cache_blk_t *blk = NULL;
 
+    comp_data_t compressed_data = {0};
+
+    compressed_data =  compress_data(data);
+    comp_type_t comp_type = compressed_data.comp_type;
+    uint32_t zero_bitmask = compressed_data.zero_bitmask;
+    printf("zero-mask=b%32b comp-type=%d", zero_bitmask, comp_type);
     // Search the tag array for a match
     for (int i = 0; i < CACHE_BLOCKS; i++) {
         if (BDI_CACHE[c_addr->index].blks[i].valid && (BDI_CACHE[c_addr->index].blks[i].tag == c_addr->tag)) {
@@ -489,7 +884,8 @@ int main (int argc, char** argv) {
     for (int i = 0; i < 16; i++) {
         data = generate_entry(&zero_mask, &comp_type);
         if (data != NULL) {
-            write_cache(addr, data, comp_type, zero_mask);
+            //write_cache(addr, data, comp_type, zero_mask);
+            write_cache(addr, data);
             free(data);
         } else {
             return -1;
