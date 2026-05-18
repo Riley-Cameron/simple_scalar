@@ -94,6 +94,55 @@
  * reordering of requests in the memory hierarchy is not possible.
  */
 
+ /* If this is defined, bdi L2 cache option is built (it still needs to be selected by the sim options to be implemented)*/
+#define ENABLE_BDI_CACHE 
+
+#ifdef ENABLE_BDI_CACHE
+/**
+ * @brief Compression type enumeration
+ * 
+ */
+typedef enum {
+    COMP_TYPE_ZERO = 0,
+    COMP_TYPE_REP_VAL,
+    COMP_TYPE_B8_D1,
+    COMP_TYPE_B8_D2,
+    COMP_TYPE_B8_D4,
+    COMP_TYPE_B4_D1,
+    COMP_TYPE_B4_D2,
+    COMP_TYPE_B2_D1,
+    COMP_TYPE_NONE,
+    NUM_COMP_TYPE
+} comp_type_t;
+
+/**
+ * @brief Struct to store information about each compression type
+ * 
+ */
+typedef struct {
+    byte_t base;       // Base size (in bytes)
+    byte_t delta;      // Delta size (in bytes)
+    byte_t size_32;    // Compressed size for a 32-byte cache line (in bytes)
+    byte_t size_64;    // Compressed size for a 64-byte cache line (in bytes)
+} comp_type_info_t;
+
+/**
+ * @brief Array of compression type info
+ * 
+ */
+comp_type_info_t comp_types[] = {
+    [COMP_TYPE_ZERO]    = {.base=1, .delta=0, .size_32=1,  .size_64=1},
+    [COMP_TYPE_REP_VAL] = {.base=8, .delta=0, .size_32=8,  .size_64=8},
+    [COMP_TYPE_B8_D1]   = {.base=8, .delta=1, .size_32=12, .size_64=16},
+    [COMP_TYPE_B8_D2]   = {.base=8, .delta=2, .size_32=16, .size_64=24},
+    [COMP_TYPE_B8_D4]   = {.base=8, .delta=4, .size_32=24, .size_64=40},
+    [COMP_TYPE_B4_D1]   = {.base=4, .delta=1, .size_32=12, .size_64=20},
+    [COMP_TYPE_B4_D2]   = {.base=4, .delta=2, .size_32=20, .size_64=36},
+    [COMP_TYPE_B2_D1]   = {.base=2, .delta=1, .size_32=18, .size_64=34},
+    [COMP_TYPE_NONE]    = {.base=0, .delta=0, .size_32=32, .size_64=64},
+};
+#endif // ENABLE_BDI_CACHE
+
 /* highly associative caches are implemented using a hash table lookup to
    speed block access, this macro decides if a cache is "highly associative" */
 #define CACHE_HIGHLY_ASSOC(cp)	((cp)->assoc > 4)
@@ -125,6 +174,11 @@ struct cache_blk_t
 				   is set when a miss fetch is initiated */
   byte_t *user_data;		/* pointer to user defined data, e.g.,
 				   pre-decode data or physical page address */
+#ifdef ENABLE_BDI_CACHE
+  unsigned int segment;         // Segment index where this block begins
+  unsigned int zero_bitmask;    // Bitmask showing which offsets correspond to the implied zero base (0) and the specified base (1)
+  comp_type_t comp_type;        // Compression type
+#endif
   /* DATA should be pointer-aligned due to preceeding field */
   /* NOTE: this is a variable-size tail array, this must be the LAST field
      defined in this structure! */
