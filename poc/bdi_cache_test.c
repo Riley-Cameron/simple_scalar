@@ -40,6 +40,18 @@ typedef enum {
     NUM_COMP_TYPE
 } comp_type_t;
 
+char * comp_type_str[NUM_COMP_TYPE] = {
+    "ZERO",
+    "REPEAT",
+    "B8-D1",
+    "B8-D2",
+    "B8-D4",
+    "B4-D1",
+    "B4-D1",
+    "B2-D1",
+    "NONE"
+};
+
 /**
  * @brief Struct to store information about each compression type
  * 
@@ -235,6 +247,16 @@ static void update_way_list(comp_cache_set_t *set, comp_cache_blk_t *blk, list_l
     }
 }
 
+static int64_t get_rand64() {
+    uint64_t r = 0;
+    // rand() typically returns up to 0x7FFF. 
+    // We shift and bitwise-OR to safely build a 64-bit integer.
+    for (int i = 0; i < 5; i++) {
+        r = (r << 15) | (rand() & 0x7FFF);
+    }
+    return (int64_t)r;
+}
+
 /**
  * @brief Generate a random & compressed entry for the cache. Parameters are passed by reference. Data is malloced and must be freed by the consumer!!
  * 
@@ -268,28 +290,40 @@ uint8_t *generate_entry() {
         }
         break;
     default:
-        uint64_t base = rand() * rand() * rand() * rand();
+        int64_t base = get_rand64();
         uint8_t base_size = get_comp_base(rand_comp_type);
         uint8_t delta_size = get_comp_delta(rand_comp_type);
+
+        printf("base=0x%lX\n", base);
         for (int i = 0; i < base_size; i++) {
-            rand_data[i] = (base >> (base_size-i)*8) & 0xFF;
+            rand_data[i] = (base >> (base_size-i-1)*8) & 0xFF;
         }
 
         for (int i = base_size; i < size; i+=base_size) {
-            uint32_t delta = rand() * rand();
-            bool zero_base = !(rand_zero_mask & (1 << i/base_size));
+            int64_t delta;
+            if (delta_size >= 8) {
+                delta = get_rand64(); // Prevent shift overflow if delta_size is 8
+            } else {
+                uint64_t raw_rand = (uint64_t)get_rand64();
+                uint64_t mask = (1ULL << (delta_size * 8)) - 1;       // e.g., 0xFF for 1-byte
+                uint64_t half_val = 1ULL << ((delta_size * 8) - 1);   // e.g., 0x80 (128) for 1-byte
+                
+                // Mask to get positive bounds, then shift down by half to allow negative deltas
+                delta = (int64_t)((raw_rand & mask) - half_val); 
+            }
+
+            bool zero_base = !(rand_zero_mask & (1ULL << i/base_size));
+
+            int64_t entry = zero_base ? delta : base+delta;
+            printf("delta=0x%016lX (%ld)\tentry=0x%016lX\n", delta, delta, entry);
             for (int j = 0; j < base_size; j++) {
-                rand_data[i+j] = zero_base ? 0 : (base >> (base_size-j)*8) & 0xFF;
-                if (j >= (base_size-delta_size)) {
-                    rand_data[i+j] += (delta >> (base_size-j)*8) & 0xFF;
-                    
-                }
+                rand_data[i+j] = (entry >> (base_size-j-1)*8) & 0xFF;
             }
         }
         break;
     }
 
-    printf("Generated Random Data (comp-type=%d): ", rand_comp_type);
+    printf("Generated Random Data (comp-type=%s): ", comp_type_str[rand_comp_type]);
     print_data(rand_data, size);
 
     return rand_data;
@@ -395,9 +429,16 @@ uint16_t evict_cache(comp_type_t comp_type, int index, comp_cache_blk_t **blk) {
 
                 // Update the available segments count
                 max_avail_segments += get_segments_req_64(BDI_CACHE[index].blks[i].comp_type);
-                printf("evicted block: tag=0x%X start-seg=%d avail-seg=%d\n", BDI_CACHE[index].blks[i].tag, max_avail_segments_idx, max_avail_segments);
                 BDI_CACHE[index].blks[i].tag = 0;
                 BDI_CACHE[index].blks[i].valid = 0;
+
+                // check segment map for free segments before the next filled ones
+                while ((max_avail_segments < required_segments) && !((segment_map >> (max_avail_segments_idx+max_avail_segments))&1)) {
+                    max_avail_segments++;
+                    printf("found empty segment after eviction\n");
+                }
+
+                printf("evicted block: tag=0x%X start-seg=%d avail-seg=%d\n", BDI_CACHE[index].blks[i].tag, max_avail_segments_idx, max_avail_segments);
                 break;
             }
         }
@@ -799,7 +840,7 @@ int write_cache(uint32_t addr, uint8_t *data) {
     compressed_data =  compress_data(data);
     comp_type_t comp_type = compressed_data.comp_type;
     uint32_t zero_bitmask = compressed_data.zero_bitmask;
-    printf("zero-mask=b%32b comp-type=%d\n", zero_bitmask, comp_type);
+    printf("zero-mask=b%32b comp-type=%s\n", zero_bitmask, comp_type_str[comp_type]);
     // Search the tag array for a match
     for (int i = 0; i < CACHE_BLOCKS; i++) {
         if (BDI_CACHE[c_addr->index].blks[i].valid && (BDI_CACHE[c_addr->index].blks[i].tag == c_addr->tag)) {
@@ -873,7 +914,7 @@ int read_cache(uint32_t addr) {
         read_data = malloc(get_comp_size_64(blk->comp_type));
         memcpy(read_data, &BDI_CACHE[c_addr->index].data[(blk->segment)*CACHE_SEGMENT_SIZE], get_comp_size_64(blk->comp_type));
         update_way_list(&BDI_CACHE[c_addr->index], blk, Head); // Update LRU order
-        printf("\033[32m[READ HIT] (tag=0x%X) compression-type=%d starting-segment=%d size=%d zero-mask=%0b\n\033[0m", c_addr->tag, blk->comp_type, blk->segment, get_comp_size_64(blk->comp_type), blk->zero_bitmask);
+        printf("\033[32m[READ HIT] (tag=0x%X) compression-type=%s starting-segment=%d size=%d zero-mask=%0b\n\033[0m", c_addr->tag, comp_type_str[blk->comp_type], blk->segment, get_comp_size_64(blk->comp_type), blk->zero_bitmask);
         print_data(read_data, get_comp_size_64(blk->comp_type));
     } else { // If not found, pass the request to main mem then allocate an entry (may need to evict 1+ entries)
         printf("\033[31m[READ MISS] (tag=0x%X) Writing data from main mem into L2\n\033[0m", c_addr->tag);
@@ -915,7 +956,7 @@ int main (int argc, char** argv) {
 
     // Print out compression type info
     for (int i = 0; i < NUM_COMP_TYPE; i++) {
-        printf("Compression type %02d base=%d-bytes deltas=%d-bytes\n", i, get_comp_base(i), get_comp_delta(i));
+        printf("Compression type %s: base=%d-bytes deltas=%d-bytes\n", comp_type_str[i], get_comp_base(i), get_comp_delta(i));
     }
 
     uint8_t *data;
