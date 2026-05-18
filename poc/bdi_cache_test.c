@@ -481,7 +481,7 @@ comp_data_t check_B8D1(uint8_t *data){
             bdi_count++;
         }
         else{
-            int64_t diff = arb_base - values[i];
+            int64_t diff = values[i] - arb_base;
             int64_t sdiff = (int64_t)diff;
             if (sdiff >= -128 && sdiff <= 127) {
                 bdi_count++;
@@ -515,7 +515,8 @@ comp_data_t check_B4D1(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/4] = val;
-        int64_t delta = (int64_t) val;
+        int32_t sval = (int32_t) val;
+        int64_t delta = (int64_t) sval;
         if( delta >= -128 && delta <= 127){
             zero_bitmask = zero_bitmask | (0x8000U >> i/4);
             comp_data.deltas[i/4] = (int32_t) delta;
@@ -533,7 +534,7 @@ comp_data_t check_B4D1(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint32_t diff = arb_base - values[i];
+            uint32_t diff = values[i] - arb_base;
             int32_t sdiff = (int32_t)diff;
             if(sdiff >= -128 && sdiff <= 127){
                 bdi_count++;
@@ -585,7 +586,7 @@ comp_data_t check_B8D2(uint8_t *data) {
             bdi_count++;
         }
         else {
-            uint64_t diff = arb_base - values[i];
+            uint64_t diff = values[i] - arb_base;
             int64_t sdiff = (int64_t)diff;
             if(sdiff >= -32768 && sdiff <= 32767){
                 bdi_count++;
@@ -620,9 +621,10 @@ comp_data_t check_B2D1(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/2] = val;
-        int32_t delta  = (int32_t) val;
+        int16_t sval = (int16_t) val;
+        int32_t delta  = (int32_t) sval;
         if(delta >= -128 && delta <= 127){
-            zero_bitmask = zero_bitmask | 0x80000000U >> i/2;
+            zero_bitmask = zero_bitmask | (0x80000000U >> i/2);
             comp_data.deltas[i/2] = (int32_t) delta;
         }
         else{
@@ -638,7 +640,7 @@ comp_data_t check_B2D1(uint8_t *data){
             bdi_count++;
         }
         else{
-            uint16_t diff = arb_base - values[i];
+            uint16_t diff = values[i] - arb_base;
             int16_t sdiff = (int16_t)diff;
             if(sdiff >= -128 && sdiff <= 127){
                 bdi_count++;
@@ -690,7 +692,7 @@ comp_data_t check_B4D2(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint32_t diff = arb_base - values[i];
+            uint32_t diff = values[i] - arb_base;
             int32_t sdiff = (int32_t)diff;
             if(sdiff >= -32768 && sdiff <= 32767){
                 bdi_count++;
@@ -741,7 +743,7 @@ comp_data_t check_B8D4(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint64_t diff = arb_base - values[i];
+            uint64_t diff = values[i] - arb_base;
             int64_t sdiff = (int64_t)diff;
             if(sdiff >= INT32_MIN && sdiff <= INT32_MAX){
                 bdi_count++;
