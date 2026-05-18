@@ -422,9 +422,9 @@ comp_data_t check_B8D1(uint8_t *data){
             val = val << 8 | data[j];
         }
         values[i/8] = val;
-        int64_t delta = -(int64_t)val;
+        int64_t delta = (int64_t)val;
         if(delta >= -128 && delta <= 127){
-            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            zero_bitmask = zero_bitmask | (0x80U >> i/8);
             comp_data.deltas[i/8] = (int32_t) delta;
         }
         else {
@@ -436,11 +436,11 @@ comp_data_t check_B8D1(uint8_t *data){
     }
 
     for(int i=0;i<8;i++){
-        if(zero_bitmask & (0x80 >> i)){
+        if(zero_bitmask & (0x80U >> i)){
             bdi_count++;
         }
         else{
-            uint64_t diff = arb_base - values[i];
+            int64_t diff = arb_base - values[i];
             int64_t sdiff = (int64_t)diff;
             if (sdiff >= -128 && sdiff <= 127) {
                 bdi_count++;
@@ -474,9 +474,9 @@ comp_data_t check_B4D1(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/4] = val;
-        int64_t delta = -(int64_t) val;
+        int64_t delta = (int64_t) val;
         if( delta >= -128 && delta <= 127){
-            zero_bitmask = zero_bitmask | (0x8000 >> i/4);
+            zero_bitmask = zero_bitmask | (0x8000U >> i/4);
             comp_data.deltas[i/4] = (int32_t) delta;
         }
         else {
@@ -488,7 +488,7 @@ comp_data_t check_B4D1(uint8_t *data){
     }
 
     for(int i=0; i<16; i++){
-        if(zero_bitmask & (0x8000 >> i)){
+        if(zero_bitmask & (0x8000U >> i)){
             bdi_count++;
         }
         else {
@@ -526,9 +526,9 @@ comp_data_t check_B8D2(uint8_t *data) {
             val = (val << 8) | data[j];
         }
         values[i/8] = val;
-        int64_t delta = -(int64_t) val;
+        int64_t delta = (int64_t) val;
         if( delta >= -32768 && delta <= 32767){
-            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            zero_bitmask = zero_bitmask | (0x80U >> i/8);
             comp_data.deltas[i/8] = (int32_t) delta;
         }
         else {
@@ -540,7 +540,7 @@ comp_data_t check_B8D2(uint8_t *data) {
     }
 
     for(int i=0; i<8; i++){
-        if(zero_bitmask & (0x80 >> i)){
+        if(zero_bitmask & (0x80U >> i)){
             bdi_count++;
         }
         else {
@@ -579,9 +579,9 @@ comp_data_t check_B2D1(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/2] = val;
-        int32_t delta  = -(int32_t) val;
+        int32_t delta  = (int32_t) val;
         if(delta >= -128 && delta <= 127){
-            zero_bitmask = zero_bitmask | 0x80000000 >> i/2;
+            zero_bitmask = zero_bitmask | 0x80000000U >> i/2;
             comp_data.deltas[i/2] = (int32_t) delta;
         }
         else{
@@ -593,7 +593,7 @@ comp_data_t check_B2D1(uint8_t *data){
     }
 
     for(int i=0; i<32; i++){
-        if(zero_bitmask & (0x80000000 >> i)){
+        if(zero_bitmask & (0x80000000U >> i)){
             bdi_count++;
         }
         else{
@@ -631,9 +631,9 @@ comp_data_t check_B4D2(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/4] = val;
-        int32_t delta = -(int32_t) val;
+        int32_t delta = (int32_t) val;
         if( delta >= -32768 && delta <= 32767){
-            zero_bitmask = zero_bitmask | (0x8000 >> i/4);
+            zero_bitmask = zero_bitmask | (0x8000U >> i/4);
             comp_data.deltas[i/4] = (int32_t) delta;
         }
         else {
@@ -645,7 +645,7 @@ comp_data_t check_B4D2(uint8_t *data){
     }
 
     for(int i=0; i<16; i++){
-        if(zero_bitmask & (0x8000 >> i)){
+        if(zero_bitmask & (0x8000U >> i)){
             bdi_count++;
         }
         else {
@@ -682,9 +682,9 @@ comp_data_t check_B8D4(uint8_t *data){
             val = (val << 8) | data[j];
         }
         values[i/8] = val;
-        int64_t delta = -(int64_t) val;
+        int64_t delta = (int64_t) val;
         if( delta >= INT32_MIN && delta <= INT32_MAX){
-            zero_bitmask = zero_bitmask | (0x80 >> i/8);
+            zero_bitmask = zero_bitmask | (0x80U >> i/8);
             comp_data.deltas[i/8] = (int32_t) delta;
         }
         else {
@@ -696,7 +696,7 @@ comp_data_t check_B8D4(uint8_t *data){
     }
 
     for(int i=0; i<8; i++){
-        if(zero_bitmask & (0x80 >> i)){
+        if(zero_bitmask & (0x80U >> i)){
             bdi_count++;
         }
         else {
