@@ -98,6 +98,10 @@
 #define ENABLE_BDI_CACHE 
 
 #ifdef ENABLE_BDI_CACHE
+
+#define CACHE_BLOCK_SIZE    64
+#define CACHE_SEGMENT_SIZE  8
+
 /**
  * @brief Compression type enumeration
  * 
@@ -152,6 +156,9 @@ enum cache_policy {
   LRU,		/* replace least recently used block (perfect LRU) */
   Random,	/* replace a random block */
   FIFO		/* replace the oldest block in the set */
+#ifdef ENABLE_BDI_CACHE
+  ,BDICompression /* implements BDI compression for this cache (LRU replacement)*/
+#endif
 };
 
 /* block status values */
@@ -189,6 +196,9 @@ struct cache_blk_t
 /* cache set definition (one or more blocks sharing the same set index) */
 struct cache_set_t
 {
+#ifdef ENABLE_BDI_CACHE
+  unsigned long long segment_map; /* bit map of filled segments (only works for up to 512-byte sets!) */
+#endif
   struct cache_blk_t **hash;	/* hash table: for fast access w/assoc, NULL
 				   for low-assoc caches */
   struct cache_blk_t *way_head;	/* head of way list */
@@ -201,6 +211,9 @@ struct cache_set_t
 /* cache definition */
 struct cache_t
 {
+#ifdef ENABLE_BDI_CACHE
+  int compressed; /* 0 = no compression, 1 = BDI compression */
+#endif
   /* parameters */
   char *name;			/* cache name */
   int nsets;			/* number of sets */

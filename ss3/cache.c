@@ -309,6 +309,12 @@ cache_create(char *name,		/* name of the cache */
   cp->usize = usize;
   cp->assoc = assoc;
   cp->policy = policy;
+#ifdef ENABLE_BDI_CACHE
+  if (policy == BDICompression) {
+    cp->policy = LRU;
+    cp->compressed = 1;
+  }
+#endif
   cp->hit_latency = hit_latency;
 
   /* miss/replacement functions */
@@ -409,6 +415,9 @@ cache_char2policy(char c)		/* replacement policy as a char */
   case 'l': return LRU;
   case 'r': return Random;
   case 'f': return FIFO;
+#ifdef ENABLE_BDI_CACHE
+  case 'c': return BDICompression;
+#endif
   default: fatal("bogus replacement policy, `%c'", c);
   }
 }
