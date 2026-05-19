@@ -117,7 +117,7 @@ typedef struct {
 comp_cache_set_t BDI_CACHE[CACHE_SETS];
 
 typedef struct {
-    uint64_t base;
+    int64_t base;
     int32_t deltas[32];
     int32_t zero_bitmask;
     comp_type_t comp_type;
@@ -454,7 +454,7 @@ comp_data_t check_B8D1(uint8_t *data){
     comp_data.comp_type = COMP_TYPE_NONE;
     uint64_t values[8] = {0};
     uint32_t zero_bitmask = 0;
-    uint64_t arb_base = 0;
+    int64_t arb_base = 0;
     int bdi_count = 0;
     bool arb_base_set = false;
     for(int i=0; i<64; i=i+8){
@@ -470,7 +470,7 @@ comp_data_t check_B8D1(uint8_t *data){
         }
         else {
             if(!arb_base_set) {
-                arb_base = val;
+                arb_base = (int64_t) val;
                 arb_base_set = true;
             }
         }
@@ -481,8 +481,7 @@ comp_data_t check_B8D1(uint8_t *data){
             bdi_count++;
         }
         else{
-            int64_t diff = values[i] - arb_base;
-            int64_t sdiff = (int64_t)diff;
+            int64_t sdiff = (int64_t)values[i] - arb_base;
             if (sdiff >= -128 && sdiff <= 127) {
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
@@ -491,7 +490,7 @@ comp_data_t check_B8D1(uint8_t *data){
     }
 
     if (bdi_count == 8) {
-        comp_data.base = (uint64_t)arb_base;
+        comp_data.base = (int64_t)arb_base;
         comp_data.comp_type = COMP_TYPE_B8_D1;
         comp_data.zero_bitmask = zero_bitmask;
     }
@@ -506,7 +505,7 @@ comp_data_t check_B4D1(uint8_t *data){
     comp_data.comp_type = COMP_TYPE_NONE;
     bool arb_base_set = false;
     uint16_t zero_bitmask = 0;
-    uint32_t arb_base = 0;
+    int32_t arb_base = 0;
     int bdi_count = 0;
     uint32_t values[16] = {0};
     for(int i=0; i<64; i=i+4){
@@ -523,7 +522,7 @@ comp_data_t check_B4D1(uint8_t *data){
         }
         else {
             if(!arb_base_set){
-                arb_base = val;
+                arb_base = (int32_t)val;
                 arb_base_set = true;
             }
         }
@@ -534,8 +533,7 @@ comp_data_t check_B4D1(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint32_t diff = values[i] - arb_base;
-            int32_t sdiff = (int32_t)diff;
+            int32_t sdiff = (int32_t)values[i] - arb_base;
             if(sdiff >= -128 && sdiff <= 127){
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
@@ -559,7 +557,7 @@ comp_data_t check_B8D2(uint8_t *data) {
     comp_data.comp_type = COMP_TYPE_NONE;
     bool arb_base_set = false;
     uint32_t zero_bitmask = 0;
-    uint64_t arb_base = 0;
+    int64_t arb_base = 0;
     int bdi_count = 0;
     uint64_t values[8] = {0};
     for(int i=0; i<64; i=i+8){
@@ -575,7 +573,7 @@ comp_data_t check_B8D2(uint8_t *data) {
         }
         else {
             if(!arb_base_set){
-                arb_base = val;
+                arb_base = (int64_t) val;
                 arb_base_set = true;
             }
         }
@@ -586,8 +584,7 @@ comp_data_t check_B8D2(uint8_t *data) {
             bdi_count++;
         }
         else {
-            uint64_t diff = values[i] - arb_base;
-            int64_t sdiff = (int64_t)diff;
+            int64_t sdiff = (int64_t)values[i] - arb_base;
             if(sdiff >= -32768 && sdiff <= 32767){
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
@@ -611,7 +608,7 @@ comp_data_t check_B2D1(uint8_t *data){
     comp_data.comp_type = COMP_TYPE_NONE;
     bool arb_base_set = false;
     uint32_t zero_bitmask = 0;
-    uint16_t arb_base = 0;
+    int16_t arb_base = 0;
     int bdi_count = 0;
     uint16_t values[32] = {0};
 
@@ -629,7 +626,7 @@ comp_data_t check_B2D1(uint8_t *data){
         }
         else{
             if(!arb_base_set){
-                arb_base = val;
+                arb_base = (int16_t) val;
                 arb_base_set = true;
             }
         }
@@ -640,8 +637,7 @@ comp_data_t check_B2D1(uint8_t *data){
             bdi_count++;
         }
         else{
-            uint16_t diff = values[i] - arb_base;
-            int16_t sdiff = (int16_t)diff;
+            int16_t sdiff = (int16_t)values[i] - arb_base;
             if(sdiff >= -128 && sdiff <= 127){
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
@@ -665,7 +661,7 @@ comp_data_t check_B4D2(uint8_t *data){
     comp_data.comp_type = COMP_TYPE_NONE;
     bool arb_base_set = false;
     uint16_t zero_bitmask = 0;
-    uint32_t arb_base = 0;
+    int32_t arb_base = 0;
     int bdi_count = 0;
     uint32_t values[16] = {0};
     for(int i=0; i<64; i=i+4){
@@ -681,7 +677,7 @@ comp_data_t check_B4D2(uint8_t *data){
         }
         else {
             if(!arb_base_set){
-                arb_base = val;
+                arb_base = (int32_t)val;
                 arb_base_set = true;
             }
         }
@@ -692,8 +688,7 @@ comp_data_t check_B4D2(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint32_t diff = values[i] - arb_base;
-            int32_t sdiff = (int32_t)diff;
+            int32_t sdiff = (int32_t)values[i] - arb_base;
             if(sdiff >= -32768 && sdiff <= 32767){
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
@@ -716,7 +711,7 @@ comp_data_t check_B8D4(uint8_t *data){
     comp_data.comp_type = COMP_TYPE_NONE;
     bool arb_base_set = false;
     uint32_t zero_bitmask = 0;
-    uint64_t arb_base = 0;
+    int64_t arb_base = 0;
     int bdi_count = 0;
     uint64_t values[8] = {0};
     for(int i=0; i<64; i=i+8){
@@ -732,7 +727,7 @@ comp_data_t check_B8D4(uint8_t *data){
         }
         else {
             if(!arb_base_set){
-                arb_base = val;
+                arb_base = (int64_t) val;
                 arb_base_set = true;
             }
         }
@@ -743,8 +738,7 @@ comp_data_t check_B8D4(uint8_t *data){
             bdi_count++;
         }
         else {
-            uint64_t diff = values[i] - arb_base;
-            int64_t sdiff = (int64_t)diff;
+            int64_t sdiff = (int64_t) values[i] - arb_base;
             if(sdiff >= INT32_MIN && sdiff <= INT32_MAX){
                 bdi_count++;
                 comp_data.deltas[i] = (int32_t)sdiff;
