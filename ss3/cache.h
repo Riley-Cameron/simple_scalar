@@ -59,6 +59,7 @@
 #include "machine.h"
 #include "memory.h"
 #include "stats.h"
+#include "bdi_compress.h"
 
 /*
  * This module contains code to implement various cache-like structures.  The
@@ -94,59 +95,6 @@
  * reordering of requests in the memory hierarchy is not possible.
  */
 
- /* If this is defined, bdi L2 cache option is built (it still needs to be selected by the sim options to be implemented)*/
-#define ENABLE_BDI_CACHE 
-
-#ifdef ENABLE_BDI_CACHE
-
-#define CACHE_BLOCK_SIZE    64
-#define CACHE_SEGMENT_SIZE  8
-
-/**
- * @brief Compression type enumeration
- * 
- */
-typedef enum {
-    COMP_TYPE_ZERO = 0,
-    COMP_TYPE_REP_VAL,
-    COMP_TYPE_B8_D1,
-    COMP_TYPE_B8_D2,
-    COMP_TYPE_B8_D4,
-    COMP_TYPE_B4_D1,
-    COMP_TYPE_B4_D2,
-    COMP_TYPE_B2_D1,
-    COMP_TYPE_NONE,
-    NUM_COMP_TYPE
-} comp_type_t;
-
-/**
- * @brief Struct to store information about each compression type
- * 
- */
-typedef struct {
-    byte_t base;       // Base size (in bytes)
-    byte_t delta;      // Delta size (in bytes)
-    byte_t size_32;    // Compressed size for a 32-byte cache line (in bytes)
-    byte_t size_64;    // Compressed size for a 64-byte cache line (in bytes)
-} comp_type_info_t;
-
-/**
- * @brief Array of compression type info
- * 
- */
-comp_type_info_t comp_types[] = {
-    [COMP_TYPE_ZERO]    = {.base=1, .delta=0, .size_32=1,  .size_64=1},
-    [COMP_TYPE_REP_VAL] = {.base=8, .delta=0, .size_32=8,  .size_64=8},
-    [COMP_TYPE_B8_D1]   = {.base=8, .delta=1, .size_32=12, .size_64=16},
-    [COMP_TYPE_B8_D2]   = {.base=8, .delta=2, .size_32=16, .size_64=24},
-    [COMP_TYPE_B8_D4]   = {.base=8, .delta=4, .size_32=24, .size_64=40},
-    [COMP_TYPE_B4_D1]   = {.base=4, .delta=1, .size_32=12, .size_64=20},
-    [COMP_TYPE_B4_D2]   = {.base=4, .delta=2, .size_32=20, .size_64=36},
-    [COMP_TYPE_B2_D1]   = {.base=2, .delta=1, .size_32=18, .size_64=34},
-    [COMP_TYPE_NONE]    = {.base=0, .delta=0, .size_32=32, .size_64=64},
-};
-#endif // ENABLE_BDI_CACHE
-
 /* highly associative caches are implemented using a hash table lookup to
    speed block access, this macro decides if a cache is "highly associative" */
 #define CACHE_HIGHLY_ASSOC(cp)	((cp)->assoc > 4)
@@ -156,9 +104,6 @@ enum cache_policy {
   LRU,		/* replace least recently used block (perfect LRU) */
   Random,	/* replace a random block */
   FIFO		/* replace the oldest block in the set */
-#ifdef ENABLE_BDI_CACHE
-  ,BDICompression /* implements BDI compression for this cache (LRU replacement)*/
-#endif
 };
 
 /* block status values */
@@ -181,11 +126,11 @@ struct cache_blk_t
 				   is set when a miss fetch is initiated */
   byte_t *user_data;		/* pointer to user defined data, e.g.,
 				   pre-decode data or physical page address */
-#ifdef ENABLE_BDI_CACHE
-  unsigned int segment;         // Segment index where this block begins
-  unsigned int zero_bitmask;    // Bitmask showing which offsets correspond to the implied zero base (0) and the specified base (1)
-  comp_type_t comp_type;        // Compression type
-#endif
+
+  /* BDI compression metadata (populated on every block fill when bsize==64) */
+  bdi_type_t bdi_type;		/* encoding that was applied to this block */
+  int32_t bdi_zero_bitmask;	/* per-element zero-base selector bitmask */
+
   /* DATA should be pointer-aligned due to preceeding field */
   /* NOTE: this is a variable-size tail array, this must be the LAST field
      defined in this structure! */
@@ -196,9 +141,6 @@ struct cache_blk_t
 /* cache set definition (one or more blocks sharing the same set index) */
 struct cache_set_t
 {
-#ifdef ENABLE_BDI_CACHE
-  unsigned long long segment_map; /* bit map of filled segments (only works for up to 512-byte sets!) */
-#endif
   struct cache_blk_t **hash;	/* hash table: for fast access w/assoc, NULL
 				   for low-assoc caches */
   struct cache_blk_t *way_head;	/* head of way list */
@@ -211,9 +153,6 @@ struct cache_set_t
 /* cache definition */
 struct cache_t
 {
-#ifdef ENABLE_BDI_CACHE
-  int compressed; /* 0 = no compression, 1 = BDI compression */
-#endif
   /* parameters */
   char *name;			/* cache name */
   int nsets;			/* number of sets */
@@ -265,6 +204,13 @@ struct cache_t
   counter_t replacements;	/* total number of replacements at misses */
   counter_t writebacks;		/* total number of writebacks at misses */
   counter_t invalidations;	/* total number of external invalidations */
+
+  /* BDI compression stats (only active when bsize == BDI_BLOCK_SIZE) */
+  counter_t bdi_total_fills;		/* block fills analysed for compression */
+  counter_t bdi_comp_fills;		/* fills that were compressible (not NONE) */
+  counter_t bdi_bytes_raw;		/* total raw bytes across all fills */
+  counter_t bdi_bytes_compressed;	/* total compressed bytes across all fills */
+  counter_t bdi_type_count[BDI_NUM_TYPES]; /* per-encoding hit counts */
 
   /* last block to hit, used to optimize cache hit processing */
   md_addr_t last_tagset;	/* tag of last line accessed */
