@@ -47,7 +47,7 @@ char * comp_type_str[NUM_COMP_TYPE] = {
     "B8-D2",
     "B8-D4",
     "B4-D1",
-    "B4-D1",
+    "B4-D2",
     "B2-D1",
     "NONE"
 };
