@@ -821,6 +821,43 @@ comp_data_t compress_data(uint8_t *data) {
 }
 
 /**
+ * @brief Forward declaration of bdi_decompress (defined in bdi_decompression.c)
+ *
+ * @param comp_type    Compression encoding (from the tag entry)
+ * @param zero_bitmask Per-element base selector bitmask (from the tag entry)
+ * @param cb           Pointer to compressed bytes in segment storage (big-endian)
+ * @param out          Output buffer (must be CACHE_BLOCK_SIZE bytes)
+ * @return int         0 on success, -1 on unsupported comp_type
+ */
+int bdi_decompress(comp_type_t comp_type, int32_t zero_bitmask,
+                   const uint8_t *cb, uint8_t out[CACHE_BLOCK_SIZE]);
+
+/**
+ * @brief Pack a comp_data_t into segment storage as a big-endian compressed byte stream.
+ *        Layout: [base: base_size bytes, BE] [delta_0: delta_size bytes, BE] ...
+ *        COMP_TYPE_ZERO and COMP_TYPE_NONE are handled by the caller via memcpy.
+ *
+ * @param cd  Source comp_data_t produced by compress_data()
+ * @param dst Destination buffer in segment storage
+ */
+static void pack_comp_data(const comp_data_t *cd, uint8_t *dst)
+{
+    uint8_t base_size  = get_comp_base(cd->comp_type);
+    uint8_t delta_size = get_comp_delta(cd->comp_type);
+    uint8_t n_elems    = CACHE_BLOCK_SIZE / base_size;
+
+    /* write base big-endian */
+    for (int b = 0; b < base_size; b++)
+        dst[b] = (cd->base >> (base_size - b - 1) * 8) & 0xFF;
+
+    /* write each delta big-endian at delta_size width */
+    for (int i = 0; i < n_elems; i++)
+        for (int b = 0; b < delta_size; b++)
+            dst[base_size + i * delta_size + b] =
+                (cd->deltas[i] >> (delta_size - b - 1) * 8) & 0xFF;
+}
+
+/**
  * @brief Write into the L2 compressed cache
  * 
  * @param addr 
@@ -848,7 +885,13 @@ int write_cache(uint32_t addr, uint8_t *data) {
     if (blk != NULL) {
         // Check if new size is smaller or larger than existing entry
         if (get_comp_size_64(comp_type) <= get_comp_size_64(blk->comp_type)) { // smaller (or equal) size
-            memcpy(&BDI_CACHE[c_addr->index].data[(blk->segment)*CACHE_SEGMENT_SIZE], data, get_comp_size_64(comp_type));
+            if (comp_type == COMP_TYPE_NONE) {
+                memcpy(&BDI_CACHE[c_addr->index].data[blk->segment * CACHE_SEGMENT_SIZE],
+                       data, get_comp_size_64(comp_type));
+            } else {
+                pack_comp_data(&compressed_data,
+                               &BDI_CACHE[c_addr->index].data[blk->segment * CACHE_SEGMENT_SIZE]);
+            }
             blk->comp_type = comp_type;
             blk->zero_bitmask = zero_bitmask;
             printf("\033[32m[WRITE HIT] (tag=0x%X) seg-idx: %d size: %d\n\033[0m", blk->tag, blk->segment, get_comp_size_64(comp_type));
@@ -857,7 +900,13 @@ int write_cache(uint32_t addr, uint8_t *data) {
             uint16_t segment_idx = evict_cache(comp_type, c_addr->index, &blk);
 
             // write to the given segment
-            memcpy(&BDI_CACHE[c_addr->index].data[segment_idx*CACHE_SEGMENT_SIZE], data, get_comp_size_64(comp_type));
+            if (comp_type == COMP_TYPE_NONE) {
+                memcpy(&BDI_CACHE[c_addr->index].data[segment_idx * CACHE_SEGMENT_SIZE],
+                       data, get_comp_size_64(comp_type));
+            } else {
+                pack_comp_data(&compressed_data,
+                               &BDI_CACHE[c_addr->index].data[segment_idx * CACHE_SEGMENT_SIZE]);
+            }
             blk->comp_type = comp_type;
             blk->zero_bitmask = zero_bitmask;
             blk->valid = 1;
@@ -873,7 +922,13 @@ int write_cache(uint32_t addr, uint8_t *data) {
         }
         
         // write to the given segment
-        memcpy(&BDI_CACHE[c_addr->index].data[segment_idx*CACHE_SEGMENT_SIZE], data, get_comp_size_64(comp_type));
+        if (comp_type == COMP_TYPE_NONE) {
+            memcpy(&BDI_CACHE[c_addr->index].data[segment_idx * CACHE_SEGMENT_SIZE],
+                   data, get_comp_size_64(comp_type));
+        } else {
+            pack_comp_data(&compressed_data,
+                           &BDI_CACHE[c_addr->index].data[segment_idx * CACHE_SEGMENT_SIZE]);
+        }
         blk->comp_type = comp_type;
         blk->zero_bitmask = zero_bitmask;
         blk->valid = 1;
@@ -896,7 +951,6 @@ int write_cache(uint32_t addr, uint8_t *data) {
 int read_cache(uint32_t addr) {
     cache_addr_t *c_addr = (cache_addr_t *)&addr;
     comp_cache_blk_t *blk = NULL;
-    uint8_t *read_data = NULL;
 
     // Search the tag array for a match
     for (int i = 0; i < CACHE_BLOCKS; i++) {
@@ -907,22 +961,29 @@ int read_cache(uint32_t addr) {
 
     // If found, read out the data and pass it to the decompressor
     if (blk != NULL) {
-        read_data = malloc(get_comp_size_64(blk->comp_type));
-        memcpy(read_data, &BDI_CACHE[c_addr->index].data[(blk->segment)*CACHE_SEGMENT_SIZE], get_comp_size_64(blk->comp_type));
+        uint8_t decompressed[CACHE_BLOCK_SIZE];
+        int ret = bdi_decompress(blk->comp_type,
+                                 (int32_t)blk->zero_bitmask,
+                                 &BDI_CACHE[c_addr->index].data[blk->segment * CACHE_SEGMENT_SIZE],
+                                 decompressed);
         update_way_list(&BDI_CACHE[c_addr->index], blk, Head); // Update LRU order
-        printf("\033[32m[READ HIT] (tag=0x%X) compression-type=%s starting-segment=%d size=%d zero-mask=%0b\n\033[0m", c_addr->tag, comp_type_str[blk->comp_type], blk->segment, get_comp_size_64(blk->comp_type), blk->zero_bitmask);
-        print_data(read_data, get_comp_size_64(blk->comp_type));
+        printf("\033[32m[READ HIT] (tag=0x%X) compression-type=%s starting-segment=%d size=%d zero-mask=%08X\n\033[0m",
+               c_addr->tag, comp_type_str[blk->comp_type], blk->segment,
+               get_comp_size_64(blk->comp_type), (uint32_t)blk->zero_bitmask);
+        if (ret == 0)
+            print_data(decompressed, CACHE_BLOCK_SIZE);
+        else
+            printf("[DECOMP ERROR] ret=%d\n", ret);
     } else { // If not found, pass the request to main mem then allocate an entry (may need to evict 1+ entries)
         printf("\033[31m[READ MISS] (tag=0x%X) Writing data from main mem into L2\n\033[0m", c_addr->tag);
 
         // Simulate getting data from main mem
-        read_data = generate_entry();
+        uint8_t *read_data = generate_entry();
 
         // Write it into the cache
-        write_cache(addr, read_data); 
+        write_cache(addr, read_data);
+        free(read_data);
     }
-
-    free(read_data);
 
     return 0;
 }
