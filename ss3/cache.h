@@ -211,6 +211,7 @@ struct cache_t
   counter_t bdi_bytes_raw;		/* total raw bytes across all fills */
   counter_t bdi_bytes_compressed;	/* total compressed bytes across all fills */
   counter_t bdi_type_count[BDI_NUM_TYPES]; /* per-encoding hit counts */
+  counter_t bdi_decomp_count;		/* L2 hits that required decompression */
 
   /* last block to hit, used to optimize cache hit processing */
   md_addr_t last_tagset;	/* tag of last line accessed */

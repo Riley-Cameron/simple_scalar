@@ -354,3 +354,136 @@ bdi_type_t bdi_compress(const uint8_t *data, int32_t *zero_bitmask_out)
 
     return BDI_NONE;
 }
+
+/* -------------------------------------------------------------------------
+ * Decompression
+ *
+ * Ported from Mohammed's poc/bdi_decompression.c.
+ * Adapted to use bdi_type_t instead of comp_type_t.
+ * Logic and byte layout are identical to the original.
+ * ---------------------------------------------------------------------- */
+
+int bdi_decompress(bdi_type_t type, int32_t zero_bitmask,
+                   const uint8_t *cb, uint8_t out[BDI_BLOCK_SIZE])
+{
+    switch (type) {
+
+    case BDI_ZERO:
+        memset(out, 0, BDI_BLOCK_SIZE);
+        return 0;
+
+    case BDI_REP_VAL: {
+        /* cb[0..7]: repeated 8-byte value, big-endian */
+        int64_t base = 0;
+        int b;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        {
+            int64_t *o = (int64_t *)out;
+            int i;
+            for (i = 0; i < 8; i++)
+                o[i] = base;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D1: {
+        /* cb[0..7]: 8-byte base BE, cb[8..15]: eight 1-byte deltas */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int8_t delta = (int8_t)cb[8 + i];
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D2: {
+        /* cb[0..7]: 8-byte base BE, cb[8..23]: eight 2-byte deltas BE */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int16_t delta = (int16_t)((cb[8 + i*2] << 8) | cb[8 + i*2 + 1]);
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D4: {
+        /* cb[0..7]: 8-byte base BE, cb[8..39]: eight 4-byte deltas BE */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int32_t delta = (int32_t)(  ((uint32_t)cb[8 + i*4]     << 24)
+                                      | ((uint32_t)cb[8 + i*4 + 1] << 16)
+                                      | ((uint32_t)cb[8 + i*4 + 2] <<  8)
+                                      |  (uint32_t)cb[8 + i*4 + 3]);
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B4_D1: {
+        /* cb[0..3]: 4-byte base BE, cb[4..19]: sixteen 1-byte deltas */
+        int32_t base = (int32_t)(  ((uint32_t)cb[0] << 24)
+                                 | ((uint32_t)cb[1] << 16)
+                                 | ((uint32_t)cb[2] <<  8)
+                                 |  (uint32_t)cb[3]);
+        int32_t *o = (int32_t *)out;
+        int i;
+        for (i = 0; i < 16; i++) {
+            int8_t delta = (int8_t)cb[4 + i];
+            o[i] = ((zero_bitmask >> (15 - i)) & 1) ? (int32_t)delta
+                                                     : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B4_D2: {
+        /* cb[0..3]: 4-byte base BE, cb[4..35]: sixteen 2-byte deltas BE */
+        int32_t base = (int32_t)(  ((uint32_t)cb[0] << 24)
+                                 | ((uint32_t)cb[1] << 16)
+                                 | ((uint32_t)cb[2] <<  8)
+                                 |  (uint32_t)cb[3]);
+        int32_t *o = (int32_t *)out;
+        int i;
+        for (i = 0; i < 16; i++) {
+            int16_t delta = (int16_t)((cb[4 + i*2] << 8) | cb[4 + i*2 + 1]);
+            o[i] = ((zero_bitmask >> (15 - i)) & 1) ? (int32_t)delta
+                                                     : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B2_D1: {
+        /* cb[0..1]: 2-byte base BE, cb[2..33]: thirty-two 1-byte deltas */
+        int16_t base = (int16_t)((cb[0] << 8) | cb[1]);
+        int16_t *o   = (int16_t *)out;
+        uint32_t zmask = (uint32_t)zero_bitmask;
+        int i;
+        for (i = 0; i < 32; i++) {
+            int8_t delta = (int8_t)cb[2 + i];
+            o[i] = ((zmask >> (31 - i)) & 1) ? (int16_t)delta
+                                              : (int16_t)(base + delta);
+        }
+        return 0;
+    }
+
+    case BDI_NONE:
+    default:
+        /* Uncompressed — caller must memcpy raw bytes directly */
+        return -1;
+    }
+}

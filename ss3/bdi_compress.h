@@ -73,4 +73,11 @@ int bdi_compressed_size(bdi_type_t type);
  */
 bdi_type_t bdi_compress(const uint8_t *data, int32_t *zero_bitmask_out);
 
+/*
+ * Original implementation by Mohammed (poc/bdi_decompression.c).
+ * Adapted to use bdi_type_t instead of comp_type_t.
+ */
+int bdi_decompress(bdi_type_t type, int32_t zero_bitmask,
+                   const uint8_t *cb, uint8_t out[BDI_BLOCK_SIZE]);
+
 #endif /* BDI_COMPRESS_H */

@@ -441,7 +441,15 @@ dl1_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
       lat = cache_access(cache_dl2, cmd, baddr, NULL, bsize,
 			 /* now */now, /* pudata */NULL, /* repl addr */NULL);
       if (cmd == Read)
-	return lat;
+	{
+	  /* if the L2 block that served this read was BDI-compressed,
+	     it would require decompression before forwarding to L1 */
+	  if (cache_dl2->last_blk
+	      && (cache_dl2->last_blk->status & CACHE_BLK_VALID)
+	      && cache_dl2->last_blk->bdi_type != BDI_NONE)
+	    cache_dl2->bdi_decomp_count++;
+	  return lat;
+	}
       else
 	{
 	  /* FIXME: unlimited write buffers */
