@@ -61,6 +61,7 @@
 #include "regs.h"
 #include "memory.h"
 #include "cache.h"
+#include "bdi_compress.h"
 #include "loader.h"
 #include "syscall.h"
 #include "bpred.h"
@@ -442,7 +443,15 @@ dl1_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
       lat = cache_access(cache_dl2, cmd, baddr, NULL, bsize,
 			 /* now */now, /* pudata */NULL, /* repl addr */NULL);
       if (cmd == Read)
-	return lat;
+	{
+	  /* if the L2 block that served this read was BDI-compressed,
+	     it would require decompression before forwarding to L1 */
+	  if (cache_dl2->last_blk
+	      && (cache_dl2->last_blk->status & CACHE_BLK_VALID)
+	      && cache_dl2->last_blk->bdi_type != BDI_NONE)
+	    cache_dl2->bdi_decomp_count++;
+	  return lat;
+	}
       else
 	{
 	  /* FIXME: unlimited write buffers */
@@ -472,7 +481,41 @@ dl2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 {
   /* this is a miss to the lowest level, so access main memory */
   if (cmd == Read)
-    return mem_access_latency(bsize);
+    {
+      /* BDI compression analysis: on every L2 fill, read the block from
+         simulated memory, determine the best BDI encoding, and record the
+         metadata + byte-savings statistics on the L2 cache object.
+         bsize == BDI_BLOCK_SIZE (64) is always true here since dl2_access_fn
+         is only called from the dl2 miss path which passes cp->bsize=64. */
+      if (bsize == BDI_BLOCK_SIZE && cache_dl2)
+	{
+	  uint8_t block_data[BDI_BLOCK_SIZE];
+	  int32_t zmask = 0;
+	  bdi_type_t btype;
+	  int comp_size;
+
+	  /* read full block from simulated memory */
+	  mem_bcopy(mem_access, mem, Read, baddr, block_data, BDI_BLOCK_SIZE);
+
+	  /* analyse compression potential */
+	  btype     = bdi_compress(block_data, &zmask);
+	  comp_size = bdi_compressed_size(btype);
+
+	  /* store metadata in the L2 block tag entry */
+	  blk->bdi_type         = btype;
+	  blk->bdi_zero_bitmask = zmask;
+
+	  /* update L2 cache compression statistics */
+	  cache_dl2->bdi_total_fills++;
+	  cache_dl2->bdi_bytes_raw         += BDI_BLOCK_SIZE;
+	  cache_dl2->bdi_bytes_compressed  += comp_size;
+	  cache_dl2->bdi_type_count[btype]++;
+	  if (btype != BDI_NONE)
+	    cache_dl2->bdi_comp_fills++;
+	}
+
+      return mem_access_latency(bsize);
+    }
   else
     {
       /* FIXME: unlimited write buffers */

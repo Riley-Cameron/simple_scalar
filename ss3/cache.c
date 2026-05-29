@@ -57,6 +57,7 @@
 #include "misc.h"
 #include "machine.h"
 #include "cache.h"
+#include "bdi_compress.h"
 
 /* cache access macros */
 #define CACHE_TAG(cp, addr)	((addr) >> (cp)->tag_shift)
@@ -309,12 +310,6 @@ cache_create(char *name,		/* name of the cache */
   cp->usize = usize;
   cp->assoc = assoc;
   cp->policy = policy;
-#ifdef ENABLE_BDI_CACHE
-  if (policy == BDICompression) {
-    cp->policy = LRU;
-    cp->compressed = 1;
-  }
-#endif
   cp->hit_latency = hit_latency;
 
   /* miss/replacement functions */
@@ -415,9 +410,6 @@ cache_char2policy(char c)		/* replacement policy as a char */
   case 'l': return LRU;
   case 'r': return Random;
   case 'f': return FIFO;
-#ifdef ENABLE_BDI_CACHE
-  case 'c': return BDICompression;
-#endif
   default: fatal("bogus replacement policy, `%c'", c);
   }
 }
@@ -480,6 +472,38 @@ cache_reg_stats(struct cache_t *cp,	/* cache instance */
   sprintf(buf, "%s.inv_rate", name);
   sprintf(buf1, "%s.invalidations / %s.accesses", name, name);
   stat_reg_formula(sdb, buf, "invalidation rate (i.e., invs/ref)", buf1, NULL);
+
+  /* BDI compression statistics (only meaningful when bsize == 64) */
+  sprintf(buf, "%s.bdi_total_fills", name);
+  stat_reg_counter(sdb, buf, "BDI: total block fills analysed",
+		   &cp->bdi_total_fills, 0, NULL);
+  sprintf(buf, "%s.bdi_comp_fills", name);
+  stat_reg_counter(sdb, buf, "BDI: fills that were compressible",
+		   &cp->bdi_comp_fills, 0, NULL);
+  sprintf(buf, "%s.bdi_comp_rate", name);
+  sprintf(buf1, "%s.bdi_comp_fills / %s.bdi_total_fills", name, name);
+  stat_reg_formula(sdb, buf, "BDI: fraction of fills that compress",
+		   buf1, NULL);
+  sprintf(buf, "%s.bdi_bytes_raw", name);
+  stat_reg_counter(sdb, buf, "BDI: total raw bytes across all fills",
+		   &cp->bdi_bytes_raw, 0, NULL);
+  sprintf(buf, "%s.bdi_bytes_compressed", name);
+  stat_reg_counter(sdb, buf, "BDI: total compressed bytes across all fills",
+		   &cp->bdi_bytes_compressed, 0, NULL);
+  sprintf(buf, "%s.bdi_compress_ratio", name);
+  sprintf(buf1, "%s.bdi_bytes_raw / %s.bdi_bytes_compressed", name, name);
+  stat_reg_formula(sdb, buf, "BDI: overall compression ratio (raw/compressed)",
+		   buf1, NULL);
+
+  /* per-encoding breakdown */
+  { int t;
+    for (t = 0; t < BDI_NUM_TYPES; t++) {
+      sprintf(buf, "%s.bdi_%s", name, bdi_type_names[t]);
+      sprintf(buf1, "BDI: fills encoded as %s", bdi_type_names[t]);
+      stat_reg_counter(sdb, buf, buf1,
+		       &cp->bdi_type_count[t], 0, NULL);
+    }
+  }
 }
 
 /* print cache stats */
@@ -636,6 +660,26 @@ cache_access(struct cache_t *cp,	/* cache to access */
   /* read data block */
   lat += cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize,
 			   repl, now+lat);
+
+  /* BDI compression analysis: run on every fill for 64-byte blocks.
+     We don't physically repack the data; we just record which encoding
+     would apply and accumulate byte-savings statistics. */
+  if (cp->balloc && cp->bsize == BDI_BLOCK_SIZE)
+    {
+      int32_t zmask = 0;
+      bdi_type_t btype = bdi_compress((const uint8_t *)&repl->data[0], &zmask);
+      int comp_size    = bdi_compressed_size(btype);
+
+      repl->bdi_type          = btype;
+      repl->bdi_zero_bitmask  = zmask;
+
+      cp->bdi_total_fills++;
+      cp->bdi_bytes_raw        += BDI_BLOCK_SIZE;
+      cp->bdi_bytes_compressed += comp_size;
+      cp->bdi_type_count[btype]++;
+      if (btype != BDI_NONE)
+	cp->bdi_comp_fills++;
+    }
 
   /* copy data out of cache block */
   if (cp->balloc)
