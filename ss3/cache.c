@@ -1397,7 +1397,7 @@ cache_access(struct cache_t *cp,	/* cache to access */
   }
 
   /* if LRU replacement and this is not the first element of list, reorder */
-  if (blk->way_prev && cp->policy == LRU)
+  if (blk->way_prev && (cp->policy == LRU || cp->policy == BDI_LRU))
     {
       /* move this block to head of the way (MRU) list */
       update_way_list(&cp->sets[set], blk, Head);
