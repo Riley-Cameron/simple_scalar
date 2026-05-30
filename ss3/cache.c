@@ -817,7 +817,7 @@ cache_create(char *name,		/* name of the cache */
   cp->bsize = bsize;
   cp->balloc = balloc;
   cp->usize = usize;
-  cp->is_bdi = (strcmp(cp->name, "dl2") == 0) ? 1: 0;
+  cp->is_bdi = (policy == BDI_LRU) ? 1: 0;
   if(cp->is_bdi) cp->assoc = 2*assoc;
   else cp->assoc = assoc;
   cp->policy = policy;
