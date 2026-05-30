@@ -61,7 +61,6 @@
 #include "regs.h"
 #include "memory.h"
 #include "cache.h"
-#include "bdi_compress.h"
 #include "loader.h"
 #include "syscall.h"
 #include "bpred.h"
@@ -73,8 +72,6 @@
 #include "ptrace.h"
 #include "dlite.h"
 #include "sim.h"
-
-#define USE_DATA TRUE /* Option for using/storing real cache-data */
 
 /*
  * This file implements a very detailed out-of-order issue superscalar
@@ -480,47 +477,25 @@ dl2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 	      tick_t now)		/* time of access */
 {
   /* this is a miss to the lowest level, so access main memory */
-  if (cmd == Read)
-    {
-      /* BDI compression analysis: on every L2 fill, read the block from
-         simulated memory, determine the best BDI encoding, and record the
-         metadata + byte-savings statistics on the L2 cache object.
-         bsize == BDI_BLOCK_SIZE (64) is always true here since dl2_access_fn
-         is only called from the dl2 miss path which passes cp->bsize=64. */
-      if (bsize == BDI_BLOCK_SIZE && cache_dl2)
-	{
-	  uint8_t block_data[BDI_BLOCK_SIZE];
-	  int32_t zmask = 0;
-	  bdi_type_t btype;
-	  int comp_size;
+  if (cmd == Read) {
+    /* BDI compression analysis: on every L2 fill, read the block from
+      simulated memory, determine the best BDI encoding, and record the
+      metadata + byte-savings statistics on the L2 cache object.
+      bsize == BDI_BLOCK_SIZE (64) is always true here since dl2_access_fn
+      is only called from the dl2 miss path which passes cp->bsize=64. */
+    if (cache_dl2 && (cache_dl2->is_bdi == 1)) {
+	    uint8_t block_data[BDI_BLOCK_SIZE];
 
-	  /* read full block from simulated memory */
-	  mem_bcopy(mem_access, mem, Read, baddr, block_data, BDI_BLOCK_SIZE);
-
-	  /* analyse compression potential */
-	  btype     = bdi_compress(block_data, &zmask);
-	  comp_size = bdi_compressed_size(btype);
-
-	  /* store metadata in the L2 block tag entry */
-	  blk->bdi_type         = btype;
-	  blk->bdi_zero_bitmask = zmask;
-
-	  /* update L2 cache compression statistics */
-	  cache_dl2->bdi_total_fills++;
-	  cache_dl2->bdi_bytes_raw         += BDI_BLOCK_SIZE;
-	  cache_dl2->bdi_bytes_compressed  += comp_size;
-	  cache_dl2->bdi_type_count[btype]++;
-	  if (btype != BDI_NONE)
-	    cache_dl2->bdi_comp_fills++;
-	}
-
-      return mem_access_latency(bsize);
+	    /* read full block from simulated memory */
+	    mem_bcopy(mem_access, mem, Read, baddr, block_data, BDI_BLOCK_SIZE);
+      if(blk != NULL) memcpy(blk->data, block_data, sizeof(block_data));
     }
-  else
-    {
-      /* FIXME: unlimited write buffers */
-      return 0;
-    }
+    return mem_access_latency(bsize);
+  }
+  else {
+    /* FIXME: unlimited write buffers */
+    return 0;
+  }
 }
 
 /* l1 inst cache l1 block miss handler function */
@@ -1059,7 +1034,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (sscanf(cache_dl1_opt, "%[^:]:%d:%d:%d:%c",
 		 name, &nsets, &bsize, &assoc, &c) != 5)
 	fatal("bad l1 D-cache parms: <name>:<nsets>:<bsize>:<assoc>:<repl>");
-      cache_dl1 = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+      cache_dl1 = cache_create(name, nsets, bsize, /* balloc */TRUE,
 			       /* usize */0, assoc, cache_char2policy(c),
 			       dl1_access_fn, /* hit lat */cache_dl1_lat);
 
@@ -1072,7 +1047,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
 		     name, &nsets, &bsize, &assoc, &c) != 5)
 	    fatal("bad l2 D-cache parms: "
 		  "<name>:<nsets>:<bsize>:<assoc>:<repl>");
-	  cache_dl2 = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+	  cache_dl2 = cache_create(name, nsets, bsize, /* balloc */TRUE,
 				   /* usize */0, assoc, cache_char2policy(c),
 				   dl2_access_fn, /* hit lat */cache_dl2_lat);
 	}
@@ -1115,7 +1090,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (sscanf(cache_il1_opt, "%[^:]:%d:%d:%d:%c",
 		 name, &nsets, &bsize, &assoc, &c) != 5)
 	fatal("bad l1 I-cache parms: <name>:<nsets>:<bsize>:<assoc>:<repl>");
-      cache_il1 = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+      cache_il1 = cache_create(name, nsets, bsize, /* balloc */FALSE,
 			       /* usize */0, assoc, cache_char2policy(c),
 			       il1_access_fn, /* hit lat */cache_il1_lat);
 
@@ -1134,7 +1109,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
 		     name, &nsets, &bsize, &assoc, &c) != 5)
 	    fatal("bad l2 I-cache parms: "
 		  "<name>:<nsets>:<bsize>:<assoc>:<repl>");
-	  cache_il2 = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+	  cache_il2 = cache_create(name, nsets, bsize, /* balloc */FALSE,
 				   /* usize */0, assoc, cache_char2policy(c),
 				   il2_access_fn, /* hit lat */cache_il2_lat);
 	}
@@ -1148,7 +1123,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (sscanf(itlb_opt, "%[^:]:%d:%d:%d:%c",
 		 name, &nsets, &bsize, &assoc, &c) != 5)
 	fatal("bad TLB parms: <name>:<nsets>:<page_size>:<assoc>:<repl>");
-      itlb = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+      itlb = cache_create(name, nsets, bsize, /* balloc */FALSE,
 			  /* usize */sizeof(md_addr_t), assoc,
 			  cache_char2policy(c), itlb_access_fn,
 			  /* hit latency */1);
@@ -1162,7 +1137,7 @@ sim_check_options(struct opt_odb_t *odb,        /* options database */
       if (sscanf(dtlb_opt, "%[^:]:%d:%d:%d:%c",
 		 name, &nsets, &bsize, &assoc, &c) != 5)
 	fatal("bad TLB parms: <name>:<nsets>:<page_size>:<assoc>:<repl>");
-      dtlb = cache_create(name, nsets, bsize, /* balloc */USE_DATA,
+      dtlb = cache_create(name, nsets, bsize, /* balloc */FALSE,
 			  /* usize */sizeof(md_addr_t), assoc,
 			  cache_char2policy(c), dtlb_access_fn,
 			  /* hit latency */1);

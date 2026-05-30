@@ -57,7 +57,475 @@
 #include "misc.h"
 #include "machine.h"
 #include "cache.h"
-#include "bdi_compress.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <limits.h>
+
+
+/* -------------------------------------------------------------------------
+ * Metadata tables
+ * ---------------------------------------------------------------------- */
+
+const char *bdi_type_names[BDI_NUM_TYPES] = {
+    [BDI_ZERO]    = "ZERO",
+    [BDI_REP_VAL] = "REP_VAL",
+    [BDI_B8_D1]   = "B8-D1",
+    [BDI_B4_D1]   = "B4-D1",
+    [BDI_B8_D2]   = "B8-D2",
+    [BDI_B2_D1]   = "B2-D1",
+    [BDI_B4_D2]   = "B4-D2",   /* fixed: POC had "B4-D1" here by mistake */
+    [BDI_B8_D4]   = "B8-D4",
+    [BDI_NONE]    = "NONE"
+};
+
+/* Compressed byte count for each encoding (64-byte source block) */
+static const int bdi_sizes[BDI_NUM_TYPES] = {
+    [BDI_ZERO]    =  1,
+    [BDI_REP_VAL] =  8,
+    [BDI_B8_D1]   = 16,
+    [BDI_B4_D1]   = 20,
+    [BDI_B8_D2]   = 24,
+    [BDI_B2_D1]   = 34,
+    [BDI_B4_D2]   = 36,
+    [BDI_B8_D4]   = 40,
+    [BDI_NONE]    = 64
+};
+
+int bdi_compressed_size(bdi_type_t type)
+{
+    if (type < 0 || type >= BDI_NUM_TYPES)
+        return BDI_BLOCK_SIZE;
+    return bdi_sizes[type];
+}
+
+/* -------------------------------------------------------------------------
+ * Internal per-encoding checkers
+ *
+ * Each function returns true if the 64-byte block DATA can be represented
+ * by that encoding, and writes the zero-bitmask into *ZMASK_OUT when true.
+ *
+ * zero-bitmask convention (matches Mohammed's compressor and decompressor):
+ *   bit SET (1)   -> element fits in delta range of the zero base; use delta
+ *   bit CLEAR (0) -> element uses the arbitrary base + delta
+ *   MSB-first per element count N: element i occupies bit (N-1-i).
+ * ---------------------------------------------------------------------- */
+
+/* ZERO: every byte is 0 */
+static bool check_zero(const uint8_t *data)
+{
+    for (int i = 0; i < BDI_BLOCK_SIZE; i++)
+        if (data[i]) return false;
+    return true;
+}
+
+/* REP_VAL: the 8-byte pattern data[0..7] repeats across the entire block */
+static bool check_rep_val(const uint8_t *data)
+{
+    for (int i = 8; i < BDI_BLOCK_SIZE; i++)
+        if (data[i] != data[i & 7]) return false;
+    return true;
+}
+
+/*
+ * B8_D1: 8-byte base, eight 1-byte signed deltas.
+ * Elements: 8 x 8-byte values read big-endian.
+ * N=8, element i at bit (7-i) of a uint8_t bitmask stored in int32_t.
+ */
+static bool check_B8D1(const uint8_t *data, int32_t *zmask_out)
+{
+    uint64_t values[8];
+    int32_t  zmask    = 0;
+    int64_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; j++)
+            v = (v << 8) | data[i*8 + j];
+        values[i] = v;
+
+        int64_t sv = (int64_t)v;
+        if (sv >= -128 && sv <= 127)
+            zmask |= (0x80 >> i);           /* fits as zero-base delta */
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    /* second pass: verify all non-zero-base elements fit in 1-byte delta */
+    for (int i = 0; i < 8; i++) {
+        if (zmask & (0x80 >> i)) continue;
+        int64_t d = (int64_t)values[i] - base;
+        if (d < -128 || d > 127) return false;
+    }
+
+    if (zmask_out) *zmask_out = zmask;
+    return true;
+}
+
+/*
+ * B4_D1: 4-byte base, sixteen 1-byte signed deltas.
+ * Elements: 16 x 4-byte values read big-endian.
+ * N=16, element i at bit (15-i).
+ */
+static bool check_B4D1(const uint8_t *data, int32_t *zmask_out)
+{
+    uint32_t values[16];
+    int32_t  zmask    = 0;
+    int32_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = 0;
+        for (int j = 0; j < 4; j++)
+            v = (v << 8) | data[i*4 + j];
+        values[i] = v;
+
+        int32_t sv = (int32_t)v;
+        if (sv >= -128 && sv <= 127)
+            zmask |= (int32_t)(0x8000 >> i);
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    for (int i = 0; i < 16; i++) {
+        if (zmask & (int32_t)(0x8000 >> i)) continue;
+        int32_t d = (int32_t)values[i] - base;
+        if (d < -128 || d > 127) return false;
+    }
+
+    if (zmask_out) *zmask_out = zmask;
+    return true;
+}
+
+/*
+ * B8_D2: 8-byte base, eight 2-byte signed deltas.
+ * N=8, element i at bit (7-i).
+ */
+static bool check_B8D2(const uint8_t *data, int32_t *zmask_out)
+{
+    uint64_t values[8];
+    int32_t  zmask    = 0;
+    int64_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; j++)
+            v = (v << 8) | data[i*8 + j];
+        values[i] = v;
+
+        int64_t sv = (int64_t)v;
+        if (sv >= -32768 && sv <= 32767)
+            zmask |= (0x80 >> i);
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        if (zmask & (0x80 >> i)) continue;
+        int64_t d = (int64_t)values[i] - base;
+        if (d < -32768 || d > 32767) return false;
+    }
+
+    if (zmask_out) *zmask_out = zmask;
+    return true;
+}
+
+/*
+ * B2_D1: 2-byte base, thirty-two 1-byte signed deltas.
+ * Elements: 32 x 2-byte values read big-endian.
+ * N=32, element i at bit (31-i).  Cast to uint32_t before shifting to
+ * avoid undefined behaviour on right-shifting a negative int32_t.
+ */
+static bool check_B2D1(const uint8_t *data, int32_t *zmask_out)
+{
+    uint16_t values[32];
+    uint32_t zmask    = 0;
+    int16_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 32; i++) {
+        uint16_t v = ((uint16_t)data[i*2] << 8) | data[i*2 + 1];
+        values[i] = v;
+
+        int16_t sv = (int16_t)v;
+        if (sv >= -128 && sv <= 127)
+            zmask |= (0x80000000U >> i);
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    for (int i = 0; i < 32; i++) {
+        if (zmask & (0x80000000U >> i)) continue;
+        int16_t d = (int16_t)((int16_t)values[i] - base);
+        if (d < -128 || d > 127) return false;
+    }
+
+    if (zmask_out) *zmask_out = (int32_t)zmask;
+    return true;
+}
+
+/*
+ * B4_D2: 4-byte base, sixteen 2-byte signed deltas.
+ * N=16, element i at bit (15-i).
+ */
+static bool check_B4D2(const uint8_t *data, int32_t *zmask_out)
+{
+    uint32_t values[16];
+    int32_t  zmask    = 0;
+    int32_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = 0;
+        for (int j = 0; j < 4; j++)
+            v = (v << 8) | data[i*4 + j];
+        values[i] = v;
+
+        int32_t sv = (int32_t)v;
+        if (sv >= -32768 && sv <= 32767)
+            zmask |= (int32_t)(0x8000 >> i);
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    for (int i = 0; i < 16; i++) {
+        if (zmask & (int32_t)(0x8000 >> i)) continue;
+        int32_t d = (int32_t)values[i] - base;
+        if (d < -32768 || d > 32767) return false;
+    }
+
+    if (zmask_out) *zmask_out = zmask;
+    return true;
+}
+
+/*
+ * B8_D4: 8-byte base, eight 4-byte signed deltas.
+ * N=8, element i at bit (7-i).
+ */
+static bool check_B8D4(const uint8_t *data, int32_t *zmask_out)
+{
+    uint64_t values[8];
+    int32_t  zmask    = 0;
+    int64_t  base     = 0;
+    bool     base_set = false;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; j++)
+            v = (v << 8) | data[i*8 + j];
+        values[i] = v;
+
+        int64_t sv = (int64_t)v;
+        if (sv >= INT32_MIN && sv <= INT32_MAX)
+            zmask |= (0x80 >> i);
+        else if (!base_set) {
+            base = sv;
+            base_set = true;
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        if (zmask & (0x80 >> i)) continue;
+        int64_t d = (int64_t)values[i] - base;
+        if (d < INT32_MIN || d > INT32_MAX) return false;
+    }
+
+    if (zmask_out) *zmask_out = zmask;
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Public entry point
+ * ---------------------------------------------------------------------- */
+
+/*
+ * bdi_compress - try each BDI encoding in priority order and return the
+ * first one that covers the 64-byte block DATA.  The priority order matches
+ * Mohammed's compressor: ZERO > REP_VAL > B8D1 > B4D1 > B8D2 > B2D1 >
+ * B4D2 > B8D4 > NONE.
+ */
+bdi_type_t bdi_compress(const uint8_t *data, int32_t *zero_bitmask_out)
+{
+    int32_t zmask = 0;
+
+    if (check_zero(data))
+        return BDI_ZERO;
+
+    if (check_rep_val(data))
+        return BDI_REP_VAL;
+
+    if (check_B8D1(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B8_D1;
+    }
+    if (check_B4D1(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B4_D1;
+    }
+    if (check_B8D2(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B8_D2;
+    }
+    if (check_B2D1(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B2_D1;
+    }
+    if (check_B4D2(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B4_D2;
+    }
+    if (check_B8D4(data, &zmask)) {
+        if (zero_bitmask_out) *zero_bitmask_out = zmask;
+        return BDI_B8_D4;
+    }
+
+    return BDI_NONE;
+}
+
+/* -------------------------------------------------------------------------
+ * Decompression
+ *
+ * Ported from Mohammed's poc/bdi_decompression.c.
+ * Adapted to use bdi_type_t instead of comp_type_t.
+ * Logic and byte layout are identical to the original.
+ * ---------------------------------------------------------------------- */
+
+int bdi_decompress(bdi_type_t type, int32_t zero_bitmask,
+                   const uint8_t *cb, uint8_t out[BDI_BLOCK_SIZE])
+{
+    switch (type) {
+
+    case BDI_ZERO:
+        memset(out, 0, BDI_BLOCK_SIZE);
+        return 0;
+
+    case BDI_REP_VAL: {
+        /* cb[0..7]: repeated 8-byte value, big-endian */
+        int64_t base = 0;
+        int b;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        {
+            int64_t *o = (int64_t *)out;
+            int i;
+            for (i = 0; i < 8; i++)
+                o[i] = base;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D1: {
+        /* cb[0..7]: 8-byte base BE, cb[8..15]: eight 1-byte deltas */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int8_t delta = (int8_t)cb[8 + i];
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D2: {
+        /* cb[0..7]: 8-byte base BE, cb[8..23]: eight 2-byte deltas BE */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int16_t delta = (int16_t)((cb[8 + i*2] << 8) | cb[8 + i*2 + 1]);
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B8_D4: {
+        /* cb[0..7]: 8-byte base BE, cb[8..39]: eight 4-byte deltas BE */
+        int64_t base = 0;
+        int64_t *o = (int64_t *)out;
+        int b, i;
+        for (b = 0; b < 8; b++)
+            base = (base << 8) | cb[b];
+        for (i = 0; i < 8; i++) {
+            int32_t delta = (int32_t)(  ((uint32_t)cb[8 + i*4]     << 24)
+                                      | ((uint32_t)cb[8 + i*4 + 1] << 16)
+                                      | ((uint32_t)cb[8 + i*4 + 2] <<  8)
+                                      |  (uint32_t)cb[8 + i*4 + 3]);
+            o[i] = ((zero_bitmask >> (7 - i)) & 1) ? (int64_t)delta
+                                                    : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B4_D1: {
+        /* cb[0..3]: 4-byte base BE, cb[4..19]: sixteen 1-byte deltas */
+        int32_t base = (int32_t)(  ((uint32_t)cb[0] << 24)
+                                 | ((uint32_t)cb[1] << 16)
+                                 | ((uint32_t)cb[2] <<  8)
+                                 |  (uint32_t)cb[3]);
+        int32_t *o = (int32_t *)out;
+        int i;
+        for (i = 0; i < 16; i++) {
+            int8_t delta = (int8_t)cb[4 + i];
+            o[i] = ((zero_bitmask >> (15 - i)) & 1) ? (int32_t)delta
+                                                     : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B4_D2: {
+        /* cb[0..3]: 4-byte base BE, cb[4..35]: sixteen 2-byte deltas BE */
+        int32_t base = (int32_t)(  ((uint32_t)cb[0] << 24)
+                                 | ((uint32_t)cb[1] << 16)
+                                 | ((uint32_t)cb[2] <<  8)
+                                 |  (uint32_t)cb[3]);
+        int32_t *o = (int32_t *)out;
+        int i;
+        for (i = 0; i < 16; i++) {
+            int16_t delta = (int16_t)((cb[4 + i*2] << 8) | cb[4 + i*2 + 1]);
+            o[i] = ((zero_bitmask >> (15 - i)) & 1) ? (int32_t)delta
+                                                     : base + delta;
+        }
+        return 0;
+    }
+
+    case BDI_B2_D1: {
+        /* cb[0..1]: 2-byte base BE, cb[2..33]: thirty-two 1-byte deltas */
+        int16_t base = (int16_t)((cb[0] << 8) | cb[1]);
+        int16_t *o   = (int16_t *)out;
+        uint32_t zmask = (uint32_t)zero_bitmask;
+        int i;
+        for (i = 0; i < 32; i++) {
+            int8_t delta = (int8_t)cb[2 + i];
+            o[i] = ((zmask >> (31 - i)) & 1) ? (int16_t)delta
+                                              : (int16_t)(base + delta);
+        }
+        return 0;
+    }
+
+    case BDI_NONE:
+    default:
+        /* Uncompressed — caller must memcpy raw bytes directly */
+        return -1;
+    }
+}
 
 /* cache access macros */
 #define CACHE_TAG(cp, addr)	((addr) >> (cp)->tag_shift)
@@ -139,6 +607,46 @@
 
 /* bound sqword_t/dfloat_t to positive int */
 #define BOUND_POS(N)		((int)(MIN(MAX(0, (N)), 2147483647)))
+
+typedef struct {
+    uint8_t base;       // Base size (in bytes)
+    uint8_t delta;      // Delta size (in bytes)
+    uint8_t size_32;    // Compressed size for a 32-byte cache line (in bytes)
+    uint8_t size_64;    // Compressed size for a 64-byte cache line (in bytes)
+} comp_type_info_t;
+
+/**
+ * @brief Array of compression type info
+ * 
+ */
+comp_type_info_t comp_types[] = {
+    [BDI_ZERO]    = {.base=1, .delta=0, .size_32=1,  .size_64=1},
+    [BDI_REP_VAL] = {.base=8, .delta=0, .size_32=8,  .size_64=8},
+    [BDI_B8_D1]   = {.base=8, .delta=1, .size_32=12, .size_64=16},
+    [BDI_B8_D2]   = {.base=8, .delta=2, .size_32=16, .size_64=24},
+    [BDI_B8_D4]   = {.base=8, .delta=4, .size_32=24, .size_64=40},
+    [BDI_B4_D1]   = {.base=4, .delta=1, .size_32=12, .size_64=20},
+    [BDI_B4_D2]   = {.base=4, .delta=2, .size_32=20, .size_64=36},
+    [BDI_B2_D1]   = {.base=2, .delta=1, .size_32=18, .size_64=34},
+    [BDI_NONE]    = {.base=0, .delta=0, .size_32=32, .size_64=64},
+};
+
+/**
+ * @brief Get the compression type's data size for a 64-byte cache block
+ * 
+ * @param comp_type 
+ * @return uint8_t 
+ */
+static inline uint8_t get_comp_size_64(bdi_type_t comp_type) {return comp_types[comp_type].size_64;}
+
+/**
+ * @brief Get the segments required to hold the data for the given compression type (64-byte block mode)
+ * 
+ * @param comp_type 
+ * @return uint8_t 
+ */
+static inline uint8_t get_segments_req_64(bdi_type_t comp_type) {return 1+((get_comp_size_64(comp_type)-1) / CACHE_SEGMENT_SIZE);}
+
 
 /* unlink BLK from the hash table bucket chain in SET */
 static void
@@ -308,7 +816,9 @@ cache_create(char *name,		/* name of the cache */
   cp->bsize = bsize;
   cp->balloc = balloc;
   cp->usize = usize;
-  cp->assoc = assoc;
+  cp->is_bdi = (strcmp(cp->name, "dl2") == 0) ? 1: 0;
+  if(cp->is_bdi) cp->assoc = 2*assoc;
+  else cp->assoc = assoc;
   cp->policy = policy;
   cp->hit_latency = hit_latency;
 
@@ -345,7 +855,7 @@ cache_create(char *name,		/* name of the cache */
   cp->last_blk = NULL;
 
   /* allocate data blocks */
-  cp->data = (byte_t *)calloc(nsets * assoc,
+  cp->data = (byte_t *)calloc(nsets * cp->assoc,
 			      sizeof(struct cache_blk_t) +
 			      (cp->balloc ? (bsize*sizeof(byte_t)) : 0));
   if (!cp->data)
@@ -372,7 +882,7 @@ cache_create(char *name,		/* name of the cache */
       
       /* link the data blocks into ordered way chain and hash table bucket
          chains, if hash table exists */
-      for (j=0; j<assoc; j++)
+      for (j=0; j<cp->assoc; j++)
 	{
 	  /* locate next cache block */
 	  blk = CACHE_BINDEX(cp, cp->data, bindex);
@@ -382,6 +892,7 @@ cache_create(char *name,		/* name of the cache */
 	  blk->status = 0;
 	  blk->tag = 0;
 	  blk->ready = 0;
+    blk->segment = 0;
 	  blk->user_data = (usize != 0
 			    ? (byte_t *)calloc(usize, sizeof(byte_t)) : NULL);
 
@@ -410,6 +921,7 @@ cache_char2policy(char c)		/* replacement policy as a char */
   case 'l': return LRU;
   case 'r': return Random;
   case 'f': return FIFO;
+  case 'b': return BDI_LRU;
   default: fatal("bogus replacement policy, `%c'", c);
   }
 }
@@ -428,6 +940,7 @@ cache_config(struct cache_t *cp,	/* cache instance */
 	  cp->policy == LRU ? "LRU"
 	  : cp->policy == Random ? "Random"
 	  : cp->policy == FIFO ? "FIFO"
+    : cp->policy == BDI_LRU ? "BDI LRU"
 	  : (abort(), ""));
 }
 
@@ -474,34 +987,36 @@ cache_reg_stats(struct cache_t *cp,	/* cache instance */
   stat_reg_formula(sdb, buf, "invalidation rate (i.e., invs/ref)", buf1, NULL);
 
   /* BDI compression statistics (only meaningful when bsize == 64) */
-  sprintf(buf, "%s.bdi_total_fills", name);
-  stat_reg_counter(sdb, buf, "BDI: total block fills analysed",
-		   &cp->bdi_total_fills, 0, NULL);
-  sprintf(buf, "%s.bdi_comp_fills", name);
-  stat_reg_counter(sdb, buf, "BDI: fills that were compressible",
-		   &cp->bdi_comp_fills, 0, NULL);
-  sprintf(buf, "%s.bdi_comp_rate", name);
-  sprintf(buf1, "%s.bdi_comp_fills / %s.bdi_total_fills", name, name);
-  stat_reg_formula(sdb, buf, "BDI: fraction of fills that compress",
-		   buf1, NULL);
-  sprintf(buf, "%s.bdi_bytes_raw", name);
-  stat_reg_counter(sdb, buf, "BDI: total raw bytes across all fills",
-		   &cp->bdi_bytes_raw, 0, NULL);
-  sprintf(buf, "%s.bdi_bytes_compressed", name);
-  stat_reg_counter(sdb, buf, "BDI: total compressed bytes across all fills",
-		   &cp->bdi_bytes_compressed, 0, NULL);
-  sprintf(buf, "%s.bdi_compress_ratio", name);
-  sprintf(buf1, "%s.bdi_bytes_raw / %s.bdi_bytes_compressed", name, name);
-  stat_reg_formula(sdb, buf, "BDI: overall compression ratio (raw/compressed)",
-		   buf1, NULL);
-
-  /* per-encoding breakdown */
-  { int t;
-    for (t = 0; t < BDI_NUM_TYPES; t++) {
-      sprintf(buf, "%s.bdi_%s", name, bdi_type_names[t]);
-      sprintf(buf1, "BDI: fills encoded as %s", bdi_type_names[t]);
-      stat_reg_counter(sdb, buf, buf1,
-		       &cp->bdi_type_count[t], 0, NULL);
+  if(cp->is_bdi){
+    sprintf(buf, "%s.bdi_total_fills", name);
+    stat_reg_counter(sdb, buf, "BDI: total block fills analysed",
+         &cp->bdi_total_fills, 0, NULL);
+    sprintf(buf, "%s.bdi_comp_fills", name);
+    stat_reg_counter(sdb, buf, "BDI: fills that were compressible",
+         &cp->bdi_comp_fills, 0, NULL);
+    sprintf(buf, "%s.bdi_comp_rate", name);
+    sprintf(buf1, "%s.bdi_comp_fills / %s.bdi_total_fills", name, name);
+    stat_reg_formula(sdb, buf, "BDI: fraction of fills that compress",
+         buf1, NULL);
+    sprintf(buf, "%s.bdi_bytes_raw", name);
+    stat_reg_counter(sdb, buf, "BDI: total raw bytes across all fills",
+         &cp->bdi_bytes_raw, 0, NULL);
+    sprintf(buf, "%s.bdi_bytes_compressed", name);
+    stat_reg_counter(sdb, buf, "BDI: total compressed bytes across all fills",
+         &cp->bdi_bytes_compressed, 0, NULL);
+    sprintf(buf, "%s.bdi_compress_ratio", name);
+    sprintf(buf1, "%s.bdi_bytes_raw / %s.bdi_bytes_compressed", name, name);
+    stat_reg_formula(sdb, buf, "BDI: overall compression ratio (raw/compressed)",
+         buf1, NULL);
+  
+    /* per-encoding breakdown */
+    { int t;
+      for (t = 0; t < BDI_NUM_TYPES; t++) {
+        sprintf(buf, "%s.bdi_%s", name, bdi_type_names[t]);
+        sprintf(buf1, "BDI: fills encoded as %s", bdi_type_names[t]);
+        stat_reg_counter(sdb, buf, buf1,
+             &cp->bdi_type_count[t], 0, NULL);
+      }
     }
   }
 }
@@ -545,6 +1060,19 @@ cache_access(struct cache_t *cp,	/* cache to access */
   md_addr_t bofs = CACHE_BLK(cp, addr);
   struct cache_blk_t *blk, *repl;
   int lat = 0;
+  int32_t zmask = 0;
+  bdi_type_t btype;
+  uint8_t required_segments = 0;
+  int max_segments = (cp->assoc/2) * (cp->bsize/8);
+  int available_tags = 0;
+  struct cache_blk_t *temp_blk = NULL;
+  int comp_size = 0;
+
+  if(cp->is_bdi){
+    temp_blk = calloc(1, sizeof(struct cache_blk_t) + ((cp->bsize-1)*sizeof(byte_t)));
+    temp_blk->status = 0;
+    temp_blk->tag = 0;
+  }
 
   /* default replacement address */
   if (repl_addr)
@@ -599,7 +1127,13 @@ cache_access(struct cache_t *cp,	/* cache to access */
 
   /* **MISS** */
   cp->misses++;
-
+  if(cp->is_bdi){
+    lat += cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize,
+           temp_blk, now+lat);
+    btype     = bdi_compress(temp_blk->data, &zmask);
+    comp_size = bdi_compressed_size(btype);
+    required_segments = get_segments_req_64(btype);
+  }
   /* select the appropriate block to replace, and re-link this entry to
      the appropriate place in the way list */
   switch (cp->policy) {
@@ -614,61 +1148,151 @@ cache_access(struct cache_t *cp,	/* cache to access */
       repl = CACHE_BINDEX(cp, cp->sets[set].blks, bindex);
     }
     break;
+  case BDI_LRU:
+    if(cp->is_bdi){
+      
+      for (blk=cp->sets[set].way_head; blk; blk=blk->way_next) {
+        if (!(blk->status & CACHE_BLK_VALID)){
+          available_tags++;
+        }
+      }
+      if(available_tags == 0){
+        /* write back replaced block data */
+        if (cp->sets[set].way_tail->status & CACHE_BLK_VALID) {
+          cp->replacements++;
+  
+          // if (repl_addr) *repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
+      
+          /* don't replace the block until outstanding misses are satisfied */
+          lat += BOUND_POS(cp->sets[set].way_tail->ready - now);
+      
+          /* stall until the bus to next level of memory is available */
+          lat += BOUND_POS(cp->bus_free - (now + lat));
+      
+            /* track bus resource usage */
+          cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
+  
+          if (cp->sets[set].way_tail->status & CACHE_BLK_DIRTY){
+            /* write back the cache block */
+            cp->writebacks++;
+            lat += cp->blk_access_fn(Write,
+                  CACHE_MK_BADDR(cp, cp->sets[set].way_tail->tag, set),
+                  cp->bsize, cp->sets[set].way_tail, now+lat);
+          }
+        }
+        cp->sets[set].way_tail->status &= ~CACHE_BLK_VALID;
+        cp->sets[set].used_segments -= cp->sets[set].way_tail->num_segments;
+        cp->sets[set].way_tail->num_segments = 0;
+      }
+      for(blk=cp->sets[set].way_tail; blk; blk=blk->way_prev){
+        if(cp->sets[set].used_segments + required_segments > max_segments){
+          if((blk->status & CACHE_BLK_VALID)){
+            cp->replacements++;
+  
+            // if (repl_addr) *repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
+        
+            /* don't replace the block until outstanding misses are satisfied */
+            lat += BOUND_POS(blk->ready - now);
+        
+            /* stall until the bus to next level of memory is available */
+            lat += BOUND_POS(cp->bus_free - (now + lat));
+        
+              /* track bus resource usage */
+            cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
+  
+            if (blk->status & CACHE_BLK_DIRTY){
+              /* write back the cache block */
+              cp->writebacks++;
+              lat += cp->blk_access_fn(Write,
+                    CACHE_MK_BADDR(cp, blk->tag, set),
+                    cp->bsize, blk, now+lat);
+            }
+            blk->status &= ~CACHE_BLK_VALID;
+            cp->sets[set].used_segments -= blk->num_segments;
+            blk->num_segments = 0;
+          }
+        }
+        else{
+          break;
+        }
+      }
+      for (blk=cp->sets[set].way_head; blk; blk=blk->way_next) {
+        if (!(blk->status & CACHE_BLK_VALID)){
+          repl = blk;
+          break;
+        }
+      }
+      if (repl == NULL) panic("BDI_LRU: Failed to find an invalid block for replacement!");
+      update_way_list(&cp->sets[set], repl, Head);
+    }
+    break;
   default:
     panic("bogus replacement policy");
+  }
+
+  if(cp->is_bdi){
+    assert(repl);
+    assert(temp_blk);
+    memcpy(repl->data, temp_blk->data, cp->bsize);
+    free(temp_blk);
+    repl->num_segments = required_segments;
+    cp->sets[set].used_segments += required_segments;
   }
 
   /* remove this block from the hash bucket chain, if hash exists */
   if (cp->hsize)
     unlink_htab_ent(cp, &cp->sets[set], repl);
-
+  
   /* blow away the last block to hit */
   cp->last_tagset = 0;
   cp->last_blk = NULL;
-
+  
   /* write back replaced block data */
-  if (repl->status & CACHE_BLK_VALID)
+  // if(!cp->is_bdi){
+    if (repl->status & CACHE_BLK_VALID)
+      {
+        cp->replacements++;
+  
+        if (repl_addr)
+    *repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
+   
+        /* don't replace the block until outstanding misses are satisfied */
+        lat += BOUND_POS(repl->ready - now);
+   
+        /* stall until the bus to next level of memory is available */
+        lat += BOUND_POS(cp->bus_free - (now + lat));
+   
+        /* track bus resource usage */
+        cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
+  
+        if (repl->status & CACHE_BLK_DIRTY)
     {
-      cp->replacements++;
-
-      if (repl_addr)
-	*repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
- 
-      /* don't replace the block until outstanding misses are satisfied */
-      lat += BOUND_POS(repl->ready - now);
- 
-      /* stall until the bus to next level of memory is available */
-      lat += BOUND_POS(cp->bus_free - (now + lat));
- 
-      /* track bus resource usage */
-      cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
-
-      if (repl->status & CACHE_BLK_DIRTY)
-	{
-	  /* write back the cache block */
-	  cp->writebacks++;
-	  lat += cp->blk_access_fn(Write,
-				   CACHE_MK_BADDR(cp, repl->tag, set),
-				   cp->bsize, repl, now+lat);
-	}
+      /* write back the cache block */
+      cp->writebacks++;
+      lat += cp->blk_access_fn(Write,
+             CACHE_MK_BADDR(cp, repl->tag, set),
+             cp->bsize, repl, now+lat);
     }
+    }
+  // }
 
   /* update block tags */
   repl->tag = tag;
   repl->status = CACHE_BLK_VALID;	/* dirty bit set on update */
 
   /* read data block */
-  lat += cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize,
-			   repl, now+lat);
+  if(!cp->is_bdi){
+    lat += cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize,
+           repl, now+lat);
+  }
 
   /* BDI compression analysis: run on every fill for 64-byte blocks.
      We don't physically repack the data; we just record which encoding
      would apply and accumulate byte-savings statistics. */
-  if (cp->balloc && cp->bsize == BDI_BLOCK_SIZE)
-    {
-      int32_t zmask = 0;
-      bdi_type_t btype = bdi_compress((const uint8_t *)&repl->data[0], &zmask);
-      int comp_size    = bdi_compressed_size(btype);
+  if (cp->is_bdi) {
+      // int32_t zmask = 0;
+      // bdi_type_t btype = bdi_compress((const uint8_t *)&repl->data[0], &zmask);
+      // int comp_size    = bdi_compressed_size(btype);
 
       repl->bdi_type          = btype;
       repl->bdi_zero_bitmask  = zmask;
@@ -677,13 +1301,13 @@ cache_access(struct cache_t *cp,	/* cache to access */
       cp->bdi_bytes_raw        += BDI_BLOCK_SIZE;
       cp->bdi_bytes_compressed += comp_size;
       cp->bdi_type_count[btype]++;
-      if (btype != BDI_NONE)
-	cp->bdi_comp_fills++;
-    }
+      if (btype != BDI_NONE) cp->bdi_comp_fills++;
+  }
 
   /* copy data out of cache block */
   if (cp->balloc)
     {
+      if(p)
       CACHE_BCOPY(cmd, repl, bofs, p, nbytes);
     }
 
@@ -714,12 +1338,62 @@ cache_access(struct cache_t *cp,	/* cache to access */
   /* copy data out of cache block, if block exists */
   if (cp->balloc)
     {
+      if(p)
       CACHE_BCOPY(cmd, blk, bofs, p, nbytes);
     }
 
   /* update dirty status */
-  if (cmd == Write)
+  if (cmd == Write){
     blk->status |= CACHE_BLK_DIRTY;
+    if(cp->is_bdi){
+      cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize, temp_blk, now+lat);
+      btype = bdi_compress(temp_blk->data, &zmask);
+      comp_size = bdi_compressed_size(btype);
+      required_segments = get_segments_req_64(btype);
+      int max_segments = (cp->assoc/2) * (cp->bsize/8);
+      int segments_diff = required_segments - blk->num_segments;
+      if(segments_diff > 0 && (cp->sets[set].used_segments + segments_diff > max_segments)){
+        struct cache_blk_t *t_blk;
+        for(t_blk=cp->sets[set].way_tail; t_blk; t_blk=t_blk->way_prev){
+          if(t_blk == blk) continue;
+          if(cp->sets[set].used_segments + segments_diff > max_segments){
+            if((t_blk->status & CACHE_BLK_VALID)){
+              cp->replacements++;
+  
+              // if (repl_addr) *repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
+          
+              /* don't replace the block until outstanding misses are satisfied */
+              lat += BOUND_POS(t_blk->ready - now);
+          
+              /* stall until the bus to next level of memory is available */
+              lat += BOUND_POS(cp->bus_free - (now + lat));
+          
+                /* track bus resource usage */
+              cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
+  
+              if (t_blk->status & CACHE_BLK_DIRTY){
+                /* write back the cache block */
+                cp->writebacks++;
+                lat += cp->blk_access_fn(Write,
+                      CACHE_MK_BADDR(cp, t_blk->tag, set),
+                      cp->bsize, t_blk, now+lat);
+              }
+              t_blk->status &= ~CACHE_BLK_VALID;
+              cp->sets[set].used_segments -= t_blk->num_segments;
+              t_blk->num_segments = 0;
+            }
+          }
+          else{
+            break;
+          }
+        }
+      }
+      blk->num_segments = required_segments;
+      cp->sets[set].used_segments += segments_diff;
+      memcpy(blk->data, temp_blk->data, cp->bsize);
+      free(temp_blk);
+    }
+  }
 
   /* if LRU replacement and this is not the first element of list, reorder */
   if (blk->way_prev && cp->policy == LRU)
@@ -748,13 +1422,63 @@ cache_access(struct cache_t *cp,	/* cache to access */
 
   /* copy data out of cache block, if block exists */
   if (cp->balloc)
-    {
+    { 
+      if(p)
       CACHE_BCOPY(cmd, blk, bofs, p, nbytes);
     }
 
   /* update dirty status */
-  if (cmd == Write)
+  if (cmd == Write){
     blk->status |= CACHE_BLK_DIRTY;
+    if(cp->is_bdi){
+      cp->blk_access_fn(Read, CACHE_BADDR(cp, addr), cp->bsize, temp_blk, now+lat);
+      btype = bdi_compress(temp_blk->data, &zmask);
+      comp_size = bdi_compressed_size(btype);
+      required_segments = get_segments_req_64(btype);
+      int max_segments = (cp->assoc/2) * (cp->bsize/8);
+      int segments_diff = required_segments - blk->num_segments;
+      if(segments_diff > 0 && (cp->sets[set].used_segments + segments_diff > max_segments)){
+        struct cache_blk_t *t_blk;
+        for(t_blk=cp->sets[set].way_tail; t_blk; t_blk=t_blk->way_prev){
+          if(t_blk == blk) continue;
+          if(cp->sets[set].used_segments + segments_diff > max_segments){
+            if((t_blk->status & CACHE_BLK_VALID)){
+              cp->replacements++;
+  
+              // if (repl_addr) *repl_addr = CACHE_MK_BADDR(cp, repl->tag, set);
+          
+              /* don't replace the block until outstanding misses are satisfied */
+              lat += BOUND_POS(t_blk->ready - now);
+          
+              /* stall until the bus to next level of memory is available */
+              lat += BOUND_POS(cp->bus_free - (now + lat));
+          
+                /* track bus resource usage */
+              cp->bus_free = MAX(cp->bus_free, (now + lat)) + 1;
+  
+              if (t_blk->status & CACHE_BLK_DIRTY){
+                /* write back the cache block */
+                cp->writebacks++;
+                lat += cp->blk_access_fn(Write,
+                      CACHE_MK_BADDR(cp, t_blk->tag, set),
+                      cp->bsize, t_blk, now+lat);
+              }
+              t_blk->status &= ~CACHE_BLK_VALID;
+              cp->sets[set].used_segments -= t_blk->num_segments;
+              t_blk->num_segments = 0;
+            }
+          }
+          else{
+            break;
+          }
+        }
+      }
+      blk->num_segments = required_segments;
+      cp->sets[set].used_segments += segments_diff;
+      memcpy(blk->data, temp_blk->data, cp->bsize);
+      free(temp_blk);
+    }
+  }
 
   /* this block hit last, no change in the way list */
 
@@ -829,6 +1553,7 @@ cache_flush(struct cache_t *cp,		/* cache instance to flush */
   /* no way list updates required because all blocks are being invalidated */
   for (i=0; i<cp->nsets; i++)
     {
+      cp->sets[i].used_segments = 0;
       for (blk=cp->sets[i].way_head; blk; blk=blk->way_next)
 	{
 	  if (blk->status & CACHE_BLK_VALID)
@@ -893,7 +1618,8 @@ cache_flush_addr(struct cache_t *cp,	/* cache instance to flush */
     {
       cp->invalidations++;
       blk->status &= ~CACHE_BLK_VALID;
-
+      cp->sets[set].used_segments -= blk->num_segments; 
+      blk->num_segments = 0;
       /* blow away the last block to hit */
       cp->last_tagset = 0;
       cp->last_blk = NULL;

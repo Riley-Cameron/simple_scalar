@@ -59,7 +59,68 @@
 #include "machine.h"
 #include "memory.h"
 #include "stats.h"
-#include "bdi_compress.h"
+
+#include <stdint.h>
+
+/* BDI only applies to 64-byte cache blocks */
+#define BDI_BLOCK_SIZE 64
+
+/*
+ * BDI encoding types, listed in priority order (best compression first).
+ * The compressor tries each in sequence and returns the first that fits.
+ *
+ * Compressed sizes for a 64-byte source block:
+ *   BDI_ZERO      ->  1 byte   (all-zero token)
+ *   BDI_REP_VAL   ->  8 bytes  (one repeated 8-byte value)
+ *   BDI_B8_D1     -> 16 bytes  (8-byte base + 8 x 1-byte deltas)
+ *   BDI_B4_D1     -> 20 bytes  (4-byte base + 16 x 1-byte deltas)
+ *   BDI_B8_D2     -> 24 bytes  (8-byte base + 8 x 2-byte deltas)
+ *   BDI_B2_D1     -> 34 bytes  (2-byte base + 32 x 1-byte deltas)
+ *   BDI_B4_D2     -> 36 bytes  (4-byte base + 16 x 2-byte deltas)
+ *   BDI_B8_D4     -> 40 bytes  (8-byte base + 8 x 4-byte deltas)
+ *   BDI_NONE      -> 64 bytes  (uncompressible, stored raw)
+ */
+typedef enum {
+    BDI_ZERO    = 0,
+    BDI_REP_VAL,
+    BDI_B8_D1,
+    BDI_B4_D1,
+    BDI_B8_D2,
+    BDI_B2_D1,
+    BDI_B4_D2,
+    BDI_B8_D4,
+    BDI_NONE,
+    BDI_NUM_TYPES
+} bdi_type_t;
+
+/* Human-readable names (indexed by bdi_type_t) */
+extern const char *bdi_type_names[BDI_NUM_TYPES];
+
+/*
+ * bdi_compressed_size - return the compressed byte count for a 64-byte block
+ *   encoded with TYPE.  Returns 64 for unknown types.
+ */
+int bdi_compressed_size(bdi_type_t type);
+
+/*
+ * bdi_compress - analyse a BDI_BLOCK_SIZE (64-byte) block and return the
+ *   best-fitting BDI encoding type.
+ *
+ *   data            - pointer to the 64-byte source block
+ *   zero_bitmask_out - if non-NULL, receives the per-element zero-base
+ *                      selector bitmask produced by the winning encoder
+ *                      (0 for ZERO / REP_VAL / NONE where it is unused)
+ *
+ *   Returns BDI_NONE if the block cannot be compressed.
+ */
+bdi_type_t bdi_compress(const uint8_t *data, int32_t *zero_bitmask_out);
+
+/*
+ * Original implementation by Mohammed (poc/bdi_decompression.c).
+ * Adapted to use bdi_type_t instead of comp_type_t.
+ */
+int bdi_decompress(bdi_type_t type, int32_t zero_bitmask,
+                   const uint8_t *cb, uint8_t out[BDI_BLOCK_SIZE]);
 
 /*
  * This module contains code to implement various cache-like structures.  The
@@ -103,12 +164,31 @@
 enum cache_policy {
   LRU,		/* replace least recently used block (perfect LRU) */
   Random,	/* replace a random block */
-  FIFO		/* replace the oldest block in the set */
+  FIFO,		/* replace the oldest block in the set */
+  BDI_LRU
 };
 
 /* block status values */
 #define CACHE_BLK_VALID		0x00000001	/* block in valid, in use */
 #define CACHE_BLK_DIRTY		0x00000002	/* dirty block */
+
+/*bdi*/
+#define LOG2_8(x)  ((x) >= 128 ? 7 : (x) >= 64 ? 6 : (x) >= 32 ? 5 : (x) >= 16 ? 4 : \
+                    (x) >= 8   ? 3 : (x) >= 4  ? 2 : (x) >= 2  ? 1 : 0)
+#define LOG2_16(x) ((x) >= 32768 ? 15 : (x) >= 256 ? 8 + LOG2_8((x) >> 8) : LOG2_8(x))
+#define LOG2_32(x) ((x) >= 65536 ? 16 + LOG2_16((x) >> 16) : LOG2_16(x))
+#define CACHE_BLOCK_SIZE    64
+#define CACHE_WAYS          4
+#define CACHE_SETS          1024
+#define CACHE_SEGMENT_SIZE  8
+#define CACHE_OFFSET_BITS   LOG2_32(CACHE_BLOCK_SIZE)
+#define CACHE_INDEX_BITS    LOG2_32(CACHE_SETS)
+#define CACHE_TAG_BITS      (32-CACHE_OFFSET_BITS-CACHE_INDEX_BITS)
+#define CACHE_BLOCKS        (CACHE_WAYS*2)
+#define CACHE_SET_SIZE      (CACHE_WAYS*CACHE_BLOCK_SIZE)
+#define CACHE_SEGMENTS      (CACHE_SET_SIZE/CACHE_SEGMENT_SIZE)
+#define CACHE_SEGMENT_ERR   (CACHE_SEGMENTS+1)
+#define CACHE_SEGMENT_BITS  (LOG2_8(CACHE_SEGMENTS))
 
 /* cache block (or line) definition */
 struct cache_blk_t
@@ -130,7 +210,8 @@ struct cache_blk_t
   /* BDI compression metadata (populated on every block fill when bsize==64) */
   bdi_type_t bdi_type;		/* encoding that was applied to this block */
   int32_t bdi_zero_bitmask;	/* per-element zero-base selector bitmask */
-
+  uint64_t segment:CACHE_SEGMENT_BITS;    // Segment index where this block begins 
+  int num_segments;
   /* DATA should be pointer-aligned due to preceeding field */
   /* NOTE: this is a variable-size tail array, this must be the LAST field
      defined in this structure! */
@@ -148,6 +229,7 @@ struct cache_set_t
   struct cache_blk_t *blks;	/* cache blocks, allocated sequentially, so
 				   this pointer can also be used for random
 				   access to cache blocks */
+  int used_segments;
 };
 
 /* cache definition */
@@ -162,6 +244,7 @@ struct cache_t
   int assoc;			/* cache associativity */
   enum cache_policy policy;	/* cache replacement policy */
   unsigned int hit_latency;	/* cache hit latency */
+  int is_bdi; /*cache compression*/
 
   /* miss/replacement handler, read/write BSIZE bytes starting at BADDR
      from/into cache block BLK, returns the latency of the operation
