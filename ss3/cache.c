@@ -142,7 +142,7 @@ static bool check_B8D1(const uint8_t *data, int32_t *zmask_out)
     for (int i = 0; i < 8; i++) {
         uint64_t v = 0;
         for (int j = 0; j < 8; j++)
-            v = (v << 8) | data[i*8 + j];
+            v |= ((uint64_t)data[i*8 + j]) << (8*j);
         values[i] = v;
 
         int64_t sv = (int64_t)v;
@@ -180,7 +180,7 @@ static bool check_B4D1(const uint8_t *data, int32_t *zmask_out)
     for (int i = 0; i < 16; i++) {
         uint32_t v = 0;
         for (int j = 0; j < 4; j++)
-            v = (v << 8) | data[i*4 + j];
+            v |= ((uint32_t)data[i*4 + j]) << (8 * j);
         values[i] = v;
 
         int32_t sv = (int32_t)v;
@@ -216,7 +216,7 @@ static bool check_B8D2(const uint8_t *data, int32_t *zmask_out)
     for (int i = 0; i < 8; i++) {
         uint64_t v = 0;
         for (int j = 0; j < 8; j++)
-            v = (v << 8) | data[i*8 + j];
+            v |= ((uint64_t)data[i*8 + j]) << (8 * j);
         values[i] = v;
 
         int64_t sv = (int64_t)v;
@@ -252,7 +252,8 @@ static bool check_B2D1(const uint8_t *data, int32_t *zmask_out)
     bool     base_set = false;
 
     for (int i = 0; i < 32; i++) {
-        uint16_t v = ((uint16_t)data[i*2] << 8) | data[i*2 + 1];
+        uint16_t v = (uint16_t)data[i*2] |
+            ((uint16_t)data[i*2 + 1] << 8);
         values[i] = v;
 
         int16_t sv = (int16_t)v;
@@ -288,7 +289,7 @@ static bool check_B4D2(const uint8_t *data, int32_t *zmask_out)
     for (int i = 0; i < 16; i++) {
         uint32_t v = 0;
         for (int j = 0; j < 4; j++)
-            v = (v << 8) | data[i*4 + j];
+            v |= ((uint32_t)data[i*4 + j]) << (8 * j);
         values[i] = v;
 
         int32_t sv = (int32_t)v;
@@ -324,7 +325,7 @@ static bool check_B8D4(const uint8_t *data, int32_t *zmask_out)
     for (int i = 0; i < 8; i++) {
         uint64_t v = 0;
         for (int j = 0; j < 8; j++)
-            v = (v << 8) | data[i*8 + j];
+            v |= ((uint64_t)data[i*8 + j]) << (8 * j);
         values[i] = v;
 
         int64_t sv = (int64_t)v;
