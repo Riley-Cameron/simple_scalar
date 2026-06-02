@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 OPTIONS = [
-    ("64k 8-way L2",            "dl2:128:64:8:l"),
-    ("64k 16-way L2 (BDI)",     "dl2:128:64:8:b"),
-    ("128k 8-way L2",           "dl2:256:64:8:l")
+    ("64k 8-way L2",            "dl2:128:64:8:l -cache:dl2lat 30"),
+    ("64k 16-way L2 (BDI)",     "dl2:128:64:8:b -cache:dl2lat 32"),
+    ("128k 8-way L2",           "dl2:256:64:8:l -cache:dl2lat 30")
 ]
 
-INST = "20000000"
+INST = "20000000" 
 
 BENCHMARKS = ["gcc", "go", "ijpeg", "li", "perl"]
 
@@ -32,7 +32,7 @@ def run_benchmark(benchmark_name, sim_path, options):
         "-dir", res_dir, 
         "-benchmark", benchmark_name, 
         "-sim", sim_path, 
-        "-args", f"-fastfwd {INST} -max:inst {INST} -cache:dl1 dl1:32:64:2:l -cache:il2 il2:1024:32:1:l -mem:lat 300 2 -cache:dl1lat 3 -cache:dl2lat 30 -cache:dl2 {options}"
+        "-args", f"-fastfwd {INST} -max:inst {INST} -cache:dl1 dl1:32:64:2:l -cache:il2 il2:1024:32:1:l -mem:lat 300 2 -cache:dl1lat 3 -cache:dl2 {options}"
     ]
 
     try:
